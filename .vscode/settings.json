@@ -1,0 +1,7 @@
+{
+  "python.testing.pytestArgs": [
+    "MNS-SMS(project-root)"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true
+}
