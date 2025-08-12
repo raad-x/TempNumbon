@@ -419,4 +419,42 @@ cp data/ring4_database.json data/backup_$(date +%Y%m%d_%H%M%S).json
 
 ---
 
+Here is a list of all the modules used in the codebase, especially in main.py and the main modules in src/:
+
+External Python Modules Used
+From main.py and src/:
+
+os
+sys
+logging
+asyncio
+re
+traceback
+datetime
+pathlib
+typing
+telegram (from python-telegram-bot)
+tinydb
+dotenv (from python-dotenv)
+aiohttp
+How to Install All Dependencies
+Add the following section to your README.md for the dev team:
+
+Development Setup & Installation
+To set up your development environment, install all required Python packages using pip:
+
+# Create and activate a virtual environment (recommended)
+
+python3 -m venv venv
+source venv/bin/activate
+
+# Install all dependencies
+
+pip install python-telegram-bot tinydb python-dotenv aiohttp
+
+Alternatively, you can install all dependencies from requirements.txt:
+
+pip install -r requirements.txt
+Note: If you add new dependencies, update requirements.txt accordingly.
+
 **Production Ready • Observable • Extensible**
