@@ -638,15 +638,18 @@ class SMSPoolAPI:
                             sms_content = data.get('sms', None)
 
                             # Map numeric status codes to string values (SMSPool API documentation)
+                            # Fixed status mapping based on actual SMSPool behavior
                             status_mapping = {
                                 1: 'pending',      # SMS not received yet
                                 2: 'success',      # SMS received successfully
-                                3: 'cancelled',    # Order cancelled
+                                # SMS dispatched/processing (NOT cancelled!)
+                                3: 'processing',
                                 4: 'expired',      # Order expired
                                 5: 'timeout',      # Order timed out
                                 6: 'cancelled',    # Order cancelled/refunded
                                 'pending': 'pending',
                                 'success': 'success',
+                                'processing': 'processing',
                                 'cancelled': 'cancelled',
                                 'expired': 'expired',
                                 'timeout': 'timeout'
@@ -663,7 +666,7 @@ class SMSPoolAPI:
 
                             # Validate final status values
                             valid_statuses = [
-                                'pending', 'success', 'cancelled', 'expired', 'timeout']
+                                'pending', 'success', 'processing', 'cancelled', 'expired', 'timeout']
                             if status not in valid_statuses and not status.startswith('unknown_'):
                                 logger.warning(
                                     f"⚠️ Unexpected order status received: {status}")

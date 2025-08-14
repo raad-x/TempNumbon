@@ -120,20 +120,69 @@ margin = custom.get(service_id, PROFIT_MARGIN_PERCENT)
 
 ## 6. Quick Start
 
+### NEW: Easy Configuration Tool (No Coding Required!)
+
+For non-technical users, use the interactive configuration tool:
+
+```bash
+git clone <repository-url>
+cd MNS-SMS(project-root)
+chmod +x setup_production.sh
+./setup_production.sh      # Creates basic structure
+python3 config_manager.py  # Interactive configuration tool
+```
+
+**Configuration Tool Features:**
+
+- 🚀 Quick Setup Wizard (recommended for beginners)
+- 📱 Service Management (add/remove/configure services)
+- 💰 Pricing Control (margins, fixed prices, limits)
+- 📋 Business Rules (orders, refunds, notifications)
+- ⚙️ Technical Settings (polling, database, logs)
+- ✅ Configuration Validation
+- 💾 Backup & Restore
+
+### Traditional Setup (Advanced Users)
+
 ```bash
 git clone <repository-url>
 cd MNS-SMS(project-root)
 chmod +x setup_production.sh
 ./setup_production.sh      # Creates .env template, dirs, installs deps
-nano .env                  # Fill tokens / API key / admin IDs
+nano config.env           # Fill tokens / API key / admin IDs using centralized config
 python3 main.py
 ```
 
 Online when Telegram getMe succeeds.
 
+**See [CONFIGURATION.md](CONFIGURATION.md) for complete configuration guide.**
+
 ---
 
-## 7. Configuration (.env)
+## 7. Configuration
+
+### NEW: Centralized Configuration System
+
+The bot now features a **comprehensive centralized configuration system** that allows complete control without touching code:
+
+**Primary Configuration File: `config.env`**
+
+- 📱 Services (enable/disable, priorities, names)
+- 💰 Pricing (margins, fixed prices, limits)
+- 🏦 Wallet (deposit limits, auto-approval)
+- 🔄 Polling (intervals, timeouts)
+- 📋 Business Rules (order limits, refunds)
+- 🔔 Notifications (admin alerts)
+- 🔒 Security (rate limits, verification)
+- ⚙️ Technical (logging, database, performance)
+
+**Interactive Configuration Tool: `config_manager.py`**
+
+```bash
+python3 config_manager.py
+```
+
+### Legacy Configuration (.env)
 
 Required:
 | Variable | Description |
@@ -143,17 +192,15 @@ Required:
 | ADMIN_IDS | Comma list of admin user IDs |
 | BINANCE_WALLET | Deposit destination address |
 
-Optional:
+Optional (most settings now in config.env):
 | Variable | Purpose |
 |----------|---------|
 | PROFIT_MARGIN_PERCENT / MIN_PRICE_USD / MAX_PRICE_USD | Pricing controls |
 | ENVIRONMENT=production|development | Mode toggles |
 | LOG_LEVEL=DEBUG|INFO|WARNING | Verbosity |
 | ALLOW_MOCK=true|false | Mock fallback |
-| DATABASE_PATH | Override TinyDB path |
-| TELEGRAM_BOT_TOKEN / PROVIDER_API_KEY / ADMIN_USER_IDS | Alternate variable names |
 
-Restart after changes.
+**For complete configuration options, see [CONFIGURATION.md](CONFIGURATION.md)**
 
 ---
 
