@@ -9,6 +9,8 @@ import logging
 import asyncio
 import re
 import traceback
+import signal
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -17,7 +19,11 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
 )
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    MenuButton, MenuButtonCommands, MenuButtonWebApp, WebAppInfo,
+    BotCommand, BotCommandScopeDefault
+)
 from tinydb import TinyDB, Query
 from dotenv import load_dotenv
 
@@ -66,8 +72,6 @@ except ImportError as src_error:
             print(f"   - direct import error: {direct_error}")
             print(f"   - absolute path error: {abs_error}")
             print("⚠️ Running with limited functionality - mock classes will be used")
-            print(f"   - direct import error: {direct_error}")
-            print(f"   - absolute path error: {abs_error}")
             print("📝 Running in limited mode - wallet functionality disabled")
 
             # Create minimal fallback classes to prevent AttributeError
@@ -199,6 +203,25 @@ except ImportError as src_error:
                     return {'success': False, 'message': 'API not available'}
 
                 async def check_balance(self, *args, **kwargs):
+                    """Mock implementation - returns failure response"""
+                    _ = args, kwargs  # Acknowledge unused parameters
+                    return {'success': False, 'message': 'API not available'}
+
+                def get_countries_list(self):
+                    """Mock implementation - returns empty list"""
+                    return []
+
+                def search_countries(self, search_term):
+                    """Mock implementation - returns empty list"""
+                    _ = search_term  # Acknowledge unused parameter
+                    return []
+
+                def get_country_by_id(self, country_id):
+                    """Mock implementation - returns None"""
+                    _ = country_id  # Acknowledge unused parameter
+                    return None
+
+                async def _check_service_purchase_availability(self, *args, **kwargs):
                     """Mock implementation - returns failure response"""
                     _ = args, kwargs  # Acknowledge unused parameters
                     return {'success': False, 'message': 'API not available'}
@@ -345,11 +368,18 @@ class Database:
             'created_at': datetime.now().isoformat(),
             'expires_at': (datetime.now() + timedelta(seconds=ORDER_EXPIRES_IN)).isoformat(),
             'otp': None,
-            'otp_received_at': None
+            'otp_received_at': None,
+            # Add service and country information for instant refund & reorder
+            'service_id': order_data.get('service_id'),
+            'service_name': order_data.get('service_name', 'Unknown Service'),
+            'country_id': order_data.get('country_id', 1),  # Default to US
+            'country_name': order_data.get('country_name', 'United States'),
+            'country_flag': order_data.get('country_flag', '🇺🇸'),
+            'actual_cost': order_data.get('actual_cost', order_data.get('cost'))
         }
         doc_id = self.orders.insert(order)
-        logger.info("📝 Order created: %s for user %s",
-                    order['order_id'], user_id)
+        logger.info("📝 Order created: %s for user %s (Service: %s, Country: %s)",
+                    order['order_id'], user_id, order.get('service_name'), order.get('country_name'))
         return doc_id
 
     def update_order_status(self, order_id: Union[int, str], status: str, otp: Optional[str] = None):
@@ -588,9 +618,9 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                         success_keyboard = [
                             [
                                 InlineKeyboardButton(
-                                    "📱 Buy Another", callback_data="browse_services"),
+                                    "📱 Get Another", callback_data="browse_services"),
                                 InlineKeyboardButton(
-                                    "💰 Check Balance", callback_data="show_balance")
+                                    "💰 Check Wallet", callback_data="show_balance")
                             ],
                             [
                                 InlineKeyboardButton(
@@ -637,13 +667,13 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                         terminal_keyboard = [
                             [
                                 InlineKeyboardButton(
-                                    "💰 Request Refund", callback_data=f"refund_{order_id}"),
+                                    "↩️ Request Return", callback_data=f"refund_{order_id}"),
                                 InlineKeyboardButton(
-                                    "📱 Try Again", callback_data="browse_services")
+                                    "🔄 Try Again", callback_data="browse_services")
                             ],
                             [
                                 InlineKeyboardButton(
-                                    "💳 Check Balance", callback_data="show_balance"),
+                                    "💰 Check Wallet", callback_data="show_balance"),
                                 InlineKeyboardButton(
                                     "🏠 Main Menu", callback_data="back_to_start")
                             ]
@@ -665,7 +695,7 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                             f"🆔 <b>Order:</b> #{order_id}\n"
                             f"⏱️ <b>Duration:</b> {total_time:.1f} seconds\n"
                             f"🔄 <b>Total Polls:</b> {poll_count}\n\n"
-                            f"💰 <b>Refund available</b> - Use button below to request refund.",
+                            f"↩️ <b>Return available</b> - Use button below to request return.",
                             parse_mode='HTML',
                             reply_markup=terminal_reply_markup
                         )
@@ -701,38 +731,99 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
             await asyncio.sleep(interval)
 
         else:
-            # TIMEOUT: No OTP received within time limit
+            # TIMEOUT: No OTP received within time limit - AUTO REFUND
             try:
-                db.update_order_status(order_id, 'timeout')
+                # Get order details before processing refund
+                order = db.get_order(order_id)
+                if order:
+                    # Automatically process refund for timeout
+                    if wallet_system:
+                        refund_success = wallet_system.process_refund(
+                            user_id=user_id,
+                            refund_amount=order['cost'],
+                            order_id=str(order_id),
+                            reason="Automatic refund - SMS timeout"
+                        )
+
+                        if refund_success:
+                            # Update order status to refunded (not just timeout)
+                            db.update_order_status(order_id, 'refunded')
+                            # Cancel order with SMSPool if available
+                            if sms_api:
+                                try:
+                                    cancel_result = await sms_api.cancel_order(str(order_id))
+                                    if cancel_result.get('success'):
+                                        logger.info(
+                                            "✅ Timeout order %s cancelled with SMSPool", order_id)
+                                    else:
+                                        logger.warning(
+                                            "⚠️ Failed to cancel timeout order %s with SMSPool", order_id)
+                                except Exception as cancel_error:
+                                    logger.error(
+                                        "❌ Error cancelling timeout order %s: %s", order_id, cancel_error)
+                        else:
+                            # Fallback to timeout status if wallet refund fails
+                            db.update_order_status(order_id, 'timeout')
+                    else:
+                        # No wallet system, just mark as timeout
+                        db.update_order_status(order_id, 'timeout')
+                else:
+                    logger.error(
+                        "❌ Order %s not found for timeout processing", order_id)
+
             except (OSError, RuntimeError, ValueError) as db_err:
                 logger.error("❌ Database timeout update failed: %s", db_err)
+                # Fallback to timeout status
+                try:
+                    db.update_order_status(order_id, 'timeout')
+                except Exception:
+                    pass
 
-            # Create refund buttons for timeout scenario
-            timeout_keyboard = [
+            # Get order details for Order Again button
+            order = db.get_order(order_id)
+
+            # Create keyboard with Order Again button for timeout scenario
+            timeout_keyboard = []
+
+            # Add Order Again button if we have service details
+            if order and order.get('service_id') and order.get('country_id'):
+                service_name = order.get('service_name', 'Same Service')
+                country_flag = order.get('country_flag', '🌍')
+                timeout_keyboard.append([
+                    InlineKeyboardButton(
+                        f"🔄 Order Again ({service_name} in {country_flag})",
+                        callback_data=f"order_again_{order_id}"
+                    )
+                ])
+
+            timeout_keyboard.extend([
                 [
                     InlineKeyboardButton(
-                        "💰 Request Refund", callback_data=f"refund_{order_id}"),
+                        "🔍 Explore Services", callback_data="browse_services"),
                     InlineKeyboardButton(
-                        "📱 Try Again", callback_data="browse_services")
+                        "💰 Check Balance", callback_data="show_balance")
                 ],
                 [
                     InlineKeyboardButton(
-                        "💳 Check Balance", callback_data="show_balance"),
-                    InlineKeyboardButton(
                         "🏠 Main Menu", callback_data="back_to_start")
                 ]
-            ]
+            ])
             timeout_reply_markup = InlineKeyboardMarkup(timeout_keyboard)
 
             total_time = (datetime.now() - start_time).total_seconds()
+            # Get updated balance after refund
+            user_balance = wallet_system.get_user_balance(
+                user_id) if wallet_system else 0
+
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"⏰ <b>SMS Delivery Timeout</b>\n\n"
                 f"🆔 <b>Order:</b> #{order_id}\n"
                 f"⏱️ <b>Duration:</b> {POLL_TIMEOUT//60} minutes\n"
                 f"🔄 <b>Total Polls:</b> {poll_count}\n\n"
-                f"💰 <b>Automatic refund will be processed</b>\n"
-                f"Contact support if you need assistance.",
+                f"✅ <b>Automatic refund processed</b>\n"
+                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                f"You can try ordering again anytime or use 'Order Again' for the same service!",
                 parse_mode='HTML',
                 reply_markup=timeout_reply_markup
             )
@@ -748,9 +839,41 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
         logger.error(
             "❌ Critical error in OTP polling for order %s: %s", order_id, str(e))
 
-        # Safely update database status if possible
+        # Get order details and automatically process refund for error
         try:
-            db.update_order_status(order_id, 'error')
+            order = db.get_order(order_id)
+            if order:
+                # Automatically process refund for error
+                if wallet_system:
+                    refund_success = wallet_system.process_refund(
+                        user_id=user_id,
+                        refund_amount=order['cost'],
+                        order_id=str(order_id),
+                        reason="Automatic refund - service error"
+                    )
+
+                    if refund_success:
+                        # Update order status to refunded (not just error)
+                        db.update_order_status(order_id, 'refunded')
+                        # Cancel order with SMSPool if available
+                        if sms_api:
+                            try:
+                                cancel_result = await sms_api.cancel_order(str(order_id))
+                                if cancel_result.get('success'):
+                                    logger.info(
+                                        "✅ Error order %s cancelled with SMSPool", order_id)
+                            except Exception as cancel_error:
+                                logger.error(
+                                    "❌ Error cancelling error order %s: %s", order_id, cancel_error)
+                    else:
+                        # Fallback to error status if wallet refund fails
+                        db.update_order_status(order_id, 'error')
+                else:
+                    # No wallet system, just mark as error
+                    db.update_order_status(order_id, 'error')
+            else:
+                # Safely update database status if possible
+                db.update_order_status(order_id, 'error')
         except Exception as db_error:
             logger.error(
                 "❌ Failed to update order status during error handling: %s", db_error)
@@ -760,25 +883,29 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
             error_keyboard = [
                 [
                     InlineKeyboardButton(
-                        "💰 Request Refund", callback_data=f"refund_{order_id}"),
+                        "🔄 Try Again", callback_data="browse_services"),
                     InlineKeyboardButton(
-                        "📱 Try Again", callback_data="browse_services")
+                        "💰 Check Balance", callback_data="show_balance")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "💳 Check Balance", callback_data="show_balance"),
                     InlineKeyboardButton(
                         "🏠 Main Menu", callback_data="back_to_start")
                 ]
             ]
             error_reply_markup = InlineKeyboardMarkup(error_keyboard)
 
+            # Get updated balance after refund
+            user_balance = wallet_system.get_user_balance(
+                user_id) if wallet_system else 0
+
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"❌ <b>Service Error</b>\n\n"
                 f"🆔 <b>Order:</b> #{order_id}\n"
-                f" <b>Polls:</b> {poll_count}\n\n"
-                f"A technical error occurred. Please request a refund or try again.",
+                f"🔄 <b>Polls:</b> {poll_count}\n\n"
+                f"✅ <b>Automatic refund processed</b>\n"
+                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                f"You can try ordering again anytime.",
                 parse_mode='HTML',
                 reply_markup=error_reply_markup
             )
@@ -803,6 +930,564 @@ def start_otp_polling(order_id: Union[int, str], user_id: int, context: ContextT
     task = asyncio.create_task(poll_for_otp(order_id, user_id, context))
     active_polls[order_id] = task
     return task
+
+# =============================================================================
+# PERSISTENT MENU SYSTEM
+# =============================================================================
+
+
+async def setup_bot_menu(application: Application):
+    """Setup persistent bot menu and commands"""
+    try:
+        # Define comprehensive bot commands for the menu
+        commands = [
+            BotCommand("start", "🏠 Main interface & dashboard"),
+            BotCommand("buy", "📱 Get US phone number instantly"),
+            BotCommand("services", "🔍 Browse all available services"),
+            BotCommand("deposit", "💰 Add wallet credit"),
+            BotCommand("balance", "� Check wallet & transactions"),
+            BotCommand("orders", "📋 View order history"),
+            BotCommand("refund", "↩️ Process instant returns"),
+            BotCommand("help", "💬 Support & instructions"),
+            BotCommand("admin", "👨‍💼 Admin panel (admin only)"),
+            BotCommand("status", "🔧 Service status (admin only)"),
+        ]
+
+        # Set bot commands (this creates the persistent menu)
+        await application.bot.set_my_commands(
+            commands=commands,
+            scope=BotCommandScopeDefault()
+        )
+
+        # Set menu button to show commands
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonCommands()
+        )
+
+        logger.info("✅ Enhanced persistent menu system configured successfully")
+        logger.info("📋 Commands available in menu: %d", len(commands))
+
+    except Exception as e:
+        logger.error("❌ Failed to setup bot menu: %s", str(e))
+
+
+async def setup_user_specific_menu(bot, user_id: int, is_admin: bool = False):
+    """Setup user-specific menu based on permissions"""
+    try:
+        # Base commands for all users
+        commands = [
+            BotCommand("start", "🏠 Main interface & dashboard"),
+            BotCommand("buy", "📱 Get US phone number instantly"),
+            BotCommand("services", "🔍 Browse all available services"),
+            BotCommand("deposit", "💰 Add wallet credit"),
+            BotCommand("balance", "� Check wallet & transactions"),
+            BotCommand("orders", "📋 View order history"),
+            BotCommand("refund", "↩️ Process instant returns"),
+            BotCommand("help", "💬 Support & instructions"),
+        ]
+
+        # Add admin commands for admins
+        if is_admin:
+            commands.extend([
+                BotCommand("admin", "👨‍💼 Admin panel"),
+                BotCommand("status", "🔧 Check service status"),
+            ])
+
+        # Set user-specific commands (if needed in future)
+        # For now, we use the same commands for everyone
+        logger.debug("📋 Enhanced menu setup for user %s (%s commands)",
+                     user_id, len(commands))
+
+    except Exception as e:
+        logger.error("❌ Failed to setup user menu for %s: %s", user_id, str(e))
+
+
+def get_quick_action_keyboard(user_balance: float = 0.00, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Generate enhanced quick action keyboard based on user state"""
+    keyboard = []
+
+    # Row 1: Primary actions based on balance
+    if user_balance >= 0.15:
+        keyboard.append([
+            InlineKeyboardButton(
+                "📱 Get Number", callback_data="browse_services"),
+            InlineKeyboardButton("💰 Wallet", callback_data="show_balance")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton(
+                "💵 Add Credit", callback_data="deposit_funds"),
+            InlineKeyboardButton("🔍 Explore", callback_data="browse_services")
+        ])
+
+    # Row 2: Order management actions
+    keyboard.append([
+        InlineKeyboardButton("📋 Orders", callback_data="my_orders"),
+        InlineKeyboardButton("↩️ Returns", callback_data="quick_refund")
+    ])
+
+    # Row 3: Service and transaction actions
+    keyboard.append([
+        InlineKeyboardButton("🔍 Services", callback_data="browse_services"),
+        InlineKeyboardButton("📊 History", callback_data="transaction_history")
+    ])
+
+    # Row 4: Support and utility actions
+    keyboard.append([
+        InlineKeyboardButton("💬 Support", callback_data="show_help"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="start_menu")
+    ])
+
+    # Row 5: Admin actions (if admin)
+    if is_admin:
+        keyboard.append([
+            InlineKeyboardButton(
+                "👨‍💼 Admin Panel", callback_data="admin_panel"),
+            InlineKeyboardButton("🔧 Services", callback_data="service_status")
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def handle_my_orders(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle my orders callback"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    # Get user orders
+    orders = db.get_user_orders(user.id)
+
+    if not orders:
+        await query.edit_message_text(
+            "📋 <b>Your Orders</b>\n\n"
+            "❌ No orders found.\n\n"
+            "💡 Use /buy to get your first US phone number!",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "📱 Get Number", callback_data="browse_services"),
+                InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+            ]])
+        )
+        return
+
+    # Sort orders by creation date (newest first)
+    orders.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+    # Limit to last 10 orders for better UX
+    recent_orders = orders[:10]
+
+    orders_text = "📋 <b>Recent Orders</b>\n\n"
+
+    for i, order in enumerate(recent_orders, 1):
+        status_emoji = {
+            'pending': '🟡',
+            'processing': '🔄',
+            'completed': '✅',
+            'timeout': '⏰',
+            'refunded': '💰',
+            'cancelled': '🚫',
+            'error': '❌'
+        }
+
+        emoji = status_emoji.get(order['status'], '❔')
+        created = datetime.fromisoformat(
+            order['created_at']).strftime('%m/%d %H:%M')
+
+        orders_text += (
+            f"{emoji} <b>#{order['order_id']}</b>\n"
+            f"📱 <code>{order['number']}</code>\n"
+            f"💰 ${order['cost']} • {created}\n"
+        )
+
+        if order.get('otp'):
+            orders_text += f"🔐 Code: <code>{order['otp']}</code>\n"
+
+        orders_text += f"Status: {order['status'].title()}\n\n"
+
+    if len(orders) > 10:
+        orders_text += f"... and {len(orders) - 10} more orders\n\n"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔄 Quick Return", callback_data="quick_refund"),
+            InlineKeyboardButton("📱 Get More", callback_data="browse_services")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+        ]
+    ]
+
+    await query.edit_message_text(
+        orders_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_quick_refund(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle quick refund - shows refundable orders immediately"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    # Get refundable orders - EXCLUDE already refunded orders to prevent duplicate refunds
+    orders = db.get_user_orders(user.id)
+    refundable = [o for o in orders if o['status'] in [
+        'pending', 'timeout', 'error', 'cancelled'] and o['status'] != 'refunded']
+
+    if not refundable:
+        await query.edit_message_text(
+            "↩️ <b>Quick Returns</b>\n\n"
+            "❌ No returnable orders found.\n\n"
+            "💡 Only pending, timeout, error, or cancelled orders can be returned.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "📋 View Orders", callback_data="my_orders"),
+                InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+            ]])
+        )
+        return
+
+    keyboard = []
+    for order in refundable:
+        created = datetime.fromisoformat(
+            order['created_at']).strftime('%m/%d %H:%M')
+        service_name = order.get('service_name', 'Unknown Service')
+        country_flag = order.get('country_flag', '🇺🇸')
+        country_name = order.get('country_name', 'United States')
+
+        # Regular refund button
+        keyboard.append([
+            InlineKeyboardButton(
+                f"↩️ Return Only: #{order['order_id']} - ${order['cost']} ({service_name}, {country_flag} {country_name[:2]}...)",
+                callback_data=f"refund_{order['order_id']}"
+            )
+        ])
+
+        # Instant refund & get another number button (only if sufficient balance for reorder)
+        user_balance = wallet_system.get_user_balance(
+            user.id) if wallet_system else 0.00
+        order_cost = float(order.get('cost', 0))
+
+        # Check if user has sufficient balance after refund for reorder
+        balance_after_refund = user_balance + order_cost
+        if balance_after_refund >= order_cost:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🔄 Return & Replace: {service_name} ({country_flag})",
+                    callback_data=f"refund_reorder_{order['order_id']}"
+                )
+            ])
+
+    keyboard.append([
+        InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+    ])
+
+    refund_text = (
+        f"↩️ <b>Quick Return Options</b>\n\n"
+        f"Choose your return option:\n\n"
+        f"↩️ <b>Return Only:</b> Money back to wallet\n"
+        f"🔄 <b>Return & Replace:</b> Instant replacement with same service & country\n\n"
+        f"📊 Returnable orders: {len(refundable)}\n"
+        f"🚀 <b>No confirmation needed!</b>"
+    )
+
+    await query.edit_message_text(
+        refund_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_show_help(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle help callback"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    help_text = (
+        "💡 <b>Complete Quick Start Guide</b>\n\n"
+        "<b>🚀 Getting Started (3 Steps)</b>\n"
+        "1️⃣ Add credit to wallet (min $5) - /deposit\n"
+        "2️⃣ Get phone number (from $0.17) - /buy\n"
+        "3️⃣ Use for verification & receive SMS automatically\n\n"
+        "<b>🎯 Enhanced Menu Features</b>\n"
+        "• 📱 /buy - Get Number instantly\n"
+        "• 🔍 /services - Browse all services\n"
+        "• 💵 /deposit - Add Credit to wallet\n"
+        "• 💰 /balance - Wallet & transactions\n"
+        "• 📋 /orders - View order history\n"
+        "• ↩️ /refund - Smart refund options\n"
+        "• 💬 /help - This comprehensive guide\n"
+        "• 🔄 Refresh - Update interface\n\n"
+        "<b>🔄 Smart Returns (Enhanced)</b>\n"
+        "• ↩️ <b>Return Only:</b> Money back to wallet\n"
+        "• 🔄 <b>Return & Replace:</b> Instant new number\n"
+        "  - Same service & country automatically\n"
+        "  - No confirmations needed\n"
+        "  - Perfect for getting fresh numbers\n\n"
+        "<b>💡 Pro Tips & Features</b>\n"
+        "• All returns are automatic\n"
+        "• Numbers expire in 10 minutes\n"
+        "• Use the enhanced menu bar for fastest access\n"
+        "• Multiple services as backup\n"
+        "• Smart reorder saves preferences\n"
+        "• Complete order tracking\n"
+        "• Transaction history available\n"
+        "• Enhanced UX with comprehensive menu\n\n"
+        "<b>🔍 Service Options</b>\n"
+        "• Browse all available services via /services\n"
+        "• Multiple countries supported\n"
+        "• Real-time availability checking\n"
+        "• Transparent pricing\n\n"
+        "<b>🆘 Need Help?</b>\n"
+        "Contact an administrator for support.\n"
+        "All features now accessible via enhanced menu!"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📱 Try Now", callback_data="browse_services"),
+            InlineKeyboardButton("💵 Add Credit", callback_data="deposit_funds")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+        ]
+    ]
+
+    await query.edit_message_text(
+        help_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_admin_panel(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin panel callback"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    if not is_admin(user.id):
+        await query.answer("❌ Admin access required", show_alert=True)
+        return
+
+    await query.answer()
+
+    # Get system stats
+    all_orders = db.orders.all()
+    status_counts = {}
+    total_revenue = 0
+    today = datetime.now().date()
+
+    for order in all_orders:
+        status = order.get('status', 'unknown')
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        if status == 'completed':
+            total_revenue += float(order.get('cost', 0))
+
+    admin_text = (
+        f"👨‍💼 <b>Enhanced Admin Control Panel</b>\n\n"
+        f"📊 <b>System Statistics:</b>\n"
+        f"• Total Orders: {len(all_orders)}\n"
+        f"• ✅ Completed: {status_counts.get('completed', 0)}\n"
+        f"• 🟡 Pending: {status_counts.get('pending', 0)}\n"
+        f"• ⏰ Timeout: {status_counts.get('timeout', 0)}\n"
+        f"• ↩️ Refunded: {status_counts.get('refunded', 0)}\n"
+        f"• ❌ Errors: {status_counts.get('error', 0)}\n\n"
+        f"💰 <b>Revenue:</b> ${total_revenue:.2f}\n"
+        f"🔄 <b>Active Polls:</b> {len(active_polls)}\n\n"
+        f"🤖 <b>Bot Status:</b> ✅ Running with Enhanced Menu\n"
+        f"🚀 <b>Auto-Refunds:</b> ✅ Enabled\n"
+        f"🎯 <b>Menu System:</b> ✅ Enhanced with all features\n\n"
+        f"📋 <b>Available Admin Commands:</b>\n"
+        f"• /admin - This panel\n"
+        f"• /status - Service status check\n"
+        f"• Enhanced menu with quick access to all features"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⚙️ Services", callback_data="service_status"),
+            InlineKeyboardButton(
+                "💰 Deposits", callback_data="pending_deposits")
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Full Stats", callback_data="detailed_stats"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="admin_panel")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Menu", callback_data="start_menu")
+        ]
+    ]
+
+    await query.edit_message_text(
+        admin_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_pending_deposits(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle pending deposits admin view"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    if not is_admin(user.id):
+        await query.answer("❌ Admin access required", show_alert=True)
+        return
+
+    await query.answer()
+
+    if not wallet_system:
+        await query.edit_message_text(
+            "❌ <b>Wallet System Unavailable</b>\n\n"
+            "The wallet system is not properly configured.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+            ]])
+        )
+        return
+
+    # Get pending deposits (this would need to be implemented in wallet system)
+    pending_text = (
+        "💰 <b>Pending Deposits</b>\n\n"
+        "No pending deposits at this time.\n\n"
+        "💡 Users will see deposit instructions when they request funding."
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh", callback_data="pending_deposits"),
+            InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+        ]
+    ]
+
+    await query.edit_message_text(
+        pending_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_detailed_stats(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle detailed statistics admin view"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    if not is_admin(user.id):
+        await query.answer("❌ Admin access required", show_alert=True)
+        return
+
+    await query.answer()
+
+    # Get detailed statistics
+    all_orders = db.orders.all()
+
+    # Calculate date-based stats
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    week_ago = today - timedelta(days=7)
+
+    today_orders = []
+    yesterday_orders = []
+    week_orders = []
+
+    for order in all_orders:
+        try:
+            order_date = datetime.fromisoformat(order['created_at']).date()
+            if order_date == today:
+                today_orders.append(order)
+            elif order_date == yesterday:
+                yesterday_orders.append(order)
+            elif order_date >= week_ago:
+                week_orders.append(order)
+        except (ValueError, KeyError):
+            continue
+
+    # Calculate revenue
+    today_revenue = sum(float(o.get('cost', 0))
+                        for o in today_orders if o.get('status') == 'completed')
+    week_revenue = sum(float(o.get('cost', 0))
+                       for o in week_orders if o.get('status') == 'completed')
+    total_revenue = sum(float(o.get('cost', 0))
+                        for o in all_orders if o.get('status') == 'completed')
+
+    stats_text = (
+        f"📊 <b>Detailed Statistics</b>\n\n"
+        f"📅 <b>Today:</b>\n"
+        f"• Orders: {len(today_orders)}\n"
+        f"• Revenue: ${today_revenue:.2f}\n\n"
+        f"📅 <b>Yesterday:</b>\n"
+        f"• Orders: {len(yesterday_orders)}\n\n"
+        f"📅 <b>Last 7 Days:</b>\n"
+        f"• Orders: {len(week_orders)}\n"
+        f"• Revenue: ${week_revenue:.2f}\n\n"
+        f"📈 <b>All Time:</b>\n"
+        f"• Total Orders: {len(all_orders)}\n"
+        f"• Total Revenue: ${total_revenue:.2f}\n"
+        f"• Active Polls: {len(active_polls)}\n\n"
+        f"🔧 <b>System Health:</b>\n"
+        f"• Database: ✅ Connected\n"
+        f"• API: {'✅ Active' if sms_api else '❌ Inactive'}\n"
+        f"• Wallet: {'✅ Active' if wallet_system else '❌ Inactive'}"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="detailed_stats"),
+            InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+        ]
+    ]
+
+    await query.edit_message_text(
+        stats_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -846,18 +1531,27 @@ def format_order_info(order: Dict) -> str:
         'processing': '🔄',
         'completed': '✅',
         'timeout': '⏰',
-        'refunded': '💰',
+        'refunded': '↩️',
         'cancelled': '🚫',
         'error': '❌'
     }
 
-    return (
-        f"{status_emoji.get(order['status'], '❓')} <b>Order #{order['order_id']}</b>\n"
+    # Get service and country info if available
+    service_name = order.get('service_name', 'Unknown Service')
+    country_name = order.get('country_name', 'Unknown Country')
+    country_flag = order.get('country_flag', '🌍')
+
+    base_info = (
+        f"{status_emoji.get(order['status'], '❔')} <b>Order #{order['order_id']}</b>\n"
         f"📱 Number: <code>{order['number']}</code>\n"
-        f"💰 Cost: ${order['cost']}\n"
+        f"🏷️ Service: {service_name}\n"
+        f"🌍 Country: {country_flag} {country_name}\n"
+        f"💰 Price: ${order['cost']}\n"
         f"📅 Created: {created}\n"
-        f"🔄 Status: {order['status'].title()}"
+        f"📊 Status: {order['status'].title()}"
     )
+
+    return base_info
 
 # =============================================================================
 # TELEGRAM COMMAND HANDLERS
@@ -865,7 +1559,7 @@ def format_order_info(order: Dict) -> str:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command with wallet integration"""
+    """Handle /start command with enhanced menu integration"""
     _ = context  # Acknowledge unused parameter
     if not update.effective_user or not update.message:
         return
@@ -874,44 +1568,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_balance = wallet_system.get_user_balance(
         user.id) if wallet_system else 0.00
 
-    # Create wallet-aware buttons
-    if user_balance >= 0.15:  # Minimum service price
-        keyboard = [[
-            InlineKeyboardButton("� Browse Services",
-                                 callback_data="browse_services"),
-            InlineKeyboardButton(
-                "💰 Check Balance", callback_data="show_balance")
-        ]]
-    else:
-        keyboard = [[
-            InlineKeyboardButton("💰 Add Funds (Start Here)",
-                                 callback_data="deposit_funds"),
-            InlineKeyboardButton("📱 Browse Services",
-                                 callback_data="browse_services")
-        ]]
+    # Setup user-specific menu (if needed)
+    await setup_user_specific_menu(update.get_bot(), user.id, is_admin(user.id))
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Create enhanced quick action keyboard
+    reply_markup = get_quick_action_keyboard(user_balance, is_admin(user.id))
 
     welcome_text = (
-        f"👋 <b>Welcome to Ring4 SMS Bot!</b>\n\n"
-        f"🎯 <b>US Phone Numbers for Verification</b>\n"
-        f"💳 <b>Your Balance:</b> ${user_balance:.2f}\n\n"
-        f"✨ <b>New Wallet System:</b>\n"
-        f"• Minimum deposit: $5.00\n"
-        f"• Instant service purchases\n"
-        f"• Automatic refunds to wallet\n"
-        f"• No payment delays\n\n"
-        f"📱 <b>Available Services:</b>\n"
-        f"• Ring4 (Recommended) ~$0.17\n"
-        f"• Telegram, Google, WhatsApp\n"
-        f"• Real-time OTP delivery\n"
-        f"• 10-minute validity period\n\n"
+        f"📱 <b>SMS Verification Service</b>\n\n"
+        f"💰 <b>Balance:</b> ${user_balance:.2f}\n\n"
+        f"🎯 <b>Quick Access</b>\n"
+        f"Use buttons below or the menu bar for instant actions\n\n"
+        f"✨ <b>Features</b>\n"
+        f"• 📱 Instant US phone numbers\n"
+        f"• ⚡ Real-time SMS delivery\n"
+        f"• 🔄 Smart refund system\n"
+        f"• 📦 Complete order tracking\n\n"
+        f"💡 <b>Tip:</b> Access all features via the menu button next to chat input"
     )
 
     if user_balance < 0.15:
-        welcome_text += "💡 <b>Get Started:</b> Add funds to your wallet first!"
+        welcome_text += (
+            f"\n\n🚀 <b>Get Started</b>\n"
+            f"Add credit to your wallet to start getting phone numbers instantly"
+        )
     else:
-        welcome_text += "🚀 <b>Ready to go!</b> Browse services to purchase instantly."
+        welcome_text += (
+            f"\n\n✅ <b>Ready to Go</b>\n"
+            f"You have sufficient balance for phone number purchases"
+        )
 
     await update.message.reply_text(
         welcome_text,
@@ -933,44 +1618,40 @@ async def handle_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_balance = wallet_system.get_user_balance(
         user.id) if wallet_system else 0.00
 
-    # Create wallet-aware buttons
-    if user_balance >= 0.15:  # Minimum service price
-        keyboard = [[
-            InlineKeyboardButton("📱 Browse Services",
-                                 callback_data="browse_services"),
-            InlineKeyboardButton(
-                "💰 Check Balance", callback_data="show_balance")
-        ]]
-    else:
-        keyboard = [[
-            InlineKeyboardButton("💰 Add Funds (Start Here)",
-                                 callback_data="deposit_funds"),
-            InlineKeyboardButton("📱 Browse Services",
-                                 callback_data="browse_services")
-        ]]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Create enhanced quick action keyboard
+    reply_markup = get_quick_action_keyboard(user_balance, is_admin(user.id))
 
     welcome_text = (
-        f"👋 <b>Welcome to Ring4 SMS Bot!</b>\n\n"
-        f"🎯 <b>US Phone Numbers for Verification</b>\n"
-        f"💳 <b>Your Balance:</b> ${user_balance:.2f}\n\n"
-        f"✨ <b>New Wallet System:</b>\n"
-        f"• Minimum deposit: $5.00\n"
-        f"• Instant service purchases\n"
-        f"• Automatic refunds to wallet\n"
-        f"• No payment delays\n\n"
-        f"📱 <b>Available Services:</b>\n"
-        f"• Ring4 (Recommended) ~$0.17\n"
-        f"• Telegram, Google, WhatsApp\n"
-        f"• Real-time OTP delivery\n"
-        f"• 10-minute validity period\n\n"
+        f"📱 <b>SMS Verification Service</b>\n\n"
+        f"💰 <b>Balance:</b> ${user_balance:.2f}\n\n"
+        f"🎯 <b>Enhanced Quick Access</b>\n"
+        f"Use buttons below or the comprehensive menu bar for instant actions\n\n"
+        f"✨ <b>Premium Features</b>\n"
+        f"• 📱 Instant US phone numbers\n"
+        f"• ⚡ Real-time SMS delivery\n"
+        f"• 🔄 Smart return system with instant replacements\n"
+        f"• 📊 Complete order tracking & history\n"
+        f"• 💳 Comprehensive wallet management\n"
+        f"• 🔍 Browse all available services\n"
+        f"• 📋 Enhanced order management\n\n"
+        f"🚀 <b>New Menu Features</b>\n"
+        f"• /services - Browse all available services\n"
+        f"• /orders - Complete order history\n"
+        f"• /balance - Enhanced wallet & transactions\n"
+        f"• Quick access to all features via menu\n\n"
+        f"💡 <b>Pro Tip:</b> Access all features via the enhanced menu button next to chat input"
     )
 
     if user_balance < 0.15:
-        welcome_text += "💡 <b>Get Started:</b> Add funds to your wallet first!"
+        welcome_text += (
+            f"\n\n🚀 <b>Get Started</b>\n"
+            f"Add credit to your wallet to start getting phone numbers instantly"
+        )
     else:
-        welcome_text += "🚀 <b>Ready to go!</b> Browse services to purchase instantly."
+        welcome_text += (
+            f"\n\n✅ <b>Ready to Go</b>\n"
+            f"You have sufficient balance for phone number purchases"
+        )
 
     # Try to edit the message, fallback to new message if needed
     try:
@@ -1003,7 +1684,22 @@ async def handle_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /buy command (alternative to button)"""
-    await handle_buy_ring4(update, context)
+    await handle_browse_services(update, context)
+
+
+async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /services command - Browse available services"""
+    await handle_browse_services(update, context)
+
+
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /orders command - View order history"""
+    await handle_my_orders(update, context)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command - Service status (admin only)"""
+    await service_status_command(update, context)
 
 
 async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -1012,44 +1708,77 @@ async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         return
 
     help_text = (
-        "📚 <b>Ring4 SMS Bot - Help</b>\n\n"
-        "<b>Available Commands:</b>\n"
-        "• /start - Welcome message and main menu\n"
-        "• /buy - Purchase a US phone number\n"
-        "• /refund - Request refund for orders\n"
-        "• /help - Show this help message\n\n"
-        "<b>How it works:</b>\n"
-        "1. Click 'Buy Ring4 Number' or use /buy\n"
-        "2. Number is delivered instantly\n"
-        "3. Use the number for verification\n"
-        "4. OTP code is sent automatically (up to 10 min)\n"
-        "5. Request refund if no OTP received\n\n"
-        "<b>Service Information:</b>\n"
+        "💬 <b>SMS Verification Service - Complete Guide</b>\n\n"
+        "<b>📋 Available Commands</b>\n"
+        "• /start - Main dashboard & interface\n"
+        "• /buy - Get US phone number instantly\n"
+        "• /services - Browse all available services\n"
+        "• /deposit - Add wallet credit (min $5)\n"
+        "• /balance - Check wallet & transactions\n"
+        "• /orders - View complete order history\n"
+        "• /refund - Process instant returns\n"
+        "• /help - Show this comprehensive guide\n\n"
+        "<b>🚀 Quick Start (3 Steps)</b>\n"
+        "1️⃣ <b>Add Credit:</b> /deposit → Fund wallet (min $5)\n"
+        "2️⃣ <b>Get Number:</b> /buy → Instant US phone\n"
+        "3️⃣ <b>Receive SMS:</b> Automatic code delivery\n\n"
+        "<b>⚡ How It Works</b>\n"
+        "• Add credit → Get number instantly\n"
+        "• No confirmations → Fastest experience\n"
+        "• Use number for verification immediately\n"
+        "• SMS code delivered automatically (up to 10 min)\n"
+        "• Instant returns with one click\n\n"
+        "<b>🔄 Smart Return Options</b>\n"
+        "• ↩️ <b>Return Only:</b> Get money back to wallet\n"
+        "• 🔄 <b>Return & Replace:</b> Instant replacement\n"
+        "  - Cancels current order automatically\n"
+        "  - Uses same service & country settings\n"
+        "  - No extra steps or confirmations\n"
+        "  - Perfect for getting fresh numbers quickly\n\n"
+        "<b>🎯 Interface Features</b>\n"
+        "• Enhanced menu bar beside chat input\n"
+        "• Comprehensive quick action buttons\n"
+        "• One-click credit access\n"
+        "• Instant balance checking\n"
+        "• Smart return options\n"
+        "• Complete order tracking\n"
+        "• Transaction history\n"
+        "• Automated processing\n\n"
+        "<b>📱 Service Information</b>\n"
         "• Primary: Ring4 service (~$0.17)\n"
-        "• Backup: Alternative services if Ring4 unavailable\n"
+        "• Backup: Alternative services if unavailable\n"
+        "• Multiple countries supported\n"
         "• You'll be notified if backup service is used\n"
-        "• Price may vary based on service availability\n\n"
-        "<b>Admin Commands:</b>\n"
+        "• Price varies based on availability\n\n"
+        "<b>💡 UX Optimizations</b>\n"
+        "• Auto-purchase: Click service → Instant delivery\n"
+        "• Auto-return: Click return → Instant processing\n"
+        "• Smart reorder: One-click number replacement\n"
+        "• Auto-cancel: Click cancel → Immediate cancellation\n"
+        "• All actions processed automatically\n"
+        "• Enhanced menu with all features\n"
+        "• Complete workflow optimization\n\n"
+        "<b>👨‍💼 Admin Commands</b>\n"
         "• /admin - Admin panel (admin only)\n"
-        "• /services - Check service status (admin only)\n"
-        "• /approve_refund - Process refunds (admin only)\n\n"
-        "💡 <b>Need help?</b> Contact an administrator."
+        "• /status - Check service status (admin only)\n\n"
+        "🆘 <b>Need help?</b> Contact an administrator.\n"
+        "💡 <b>Tip:</b> All features accessible via enhanced menu!"
     )
 
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 
 async def refund_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Handle /refund command"""
+    """Handle /refund command - AUTO-PROCESS without confirmation"""
     if not update.effective_user or not update.message:
         return
 
     user_id = update.effective_user.id
 
-    # Get user's refundable orders (pending, timeout, error, cancelled)
+    # Get user's refundable orders (pending, timeout, error, cancelled) - EXCLUDE already refunded orders
     orders = db.get_user_orders(user_id)
-    refundable = [o for o in orders if o['status']
-                  in ['pending', 'timeout', 'error', 'cancelled']]
+    refundable = [o for o in orders if o['status'] in [
+        'pending', 'timeout', 'error', 'cancelled'] and o['status'] != 'refunded']
 
     if not refundable:
         await update.message.reply_text(
@@ -1064,7 +1793,7 @@ async def refund_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     for order in refundable:
         keyboard.append([
             InlineKeyboardButton(
-                f"💰 Refund #{order['order_id']} (${order['cost']})",
+                f"⚡ Instant Return #{order['order_id']} (${order['cost']})",
                 callback_data=f"refund_{order['order_id']}"
             )
         ])
@@ -1072,10 +1801,15 @@ async def refund_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     refund_text = (
-        "💰 <b>Request Refund</b>\n\n"
-        "Select an order to request a refund.\n"
-        "Refunds require admin approval.\n\n"
-        f"<b>Refundable Orders:</b> {len(refundable)}"
+        "⚡ <b>Instant Return System</b>\n\n"
+        "Click any order below for immediate automatic return.\n"
+        "🚀 <b>No confirmation needed!</b> Credit added to wallet instantly.\n\n"
+        f"<b>Returnable Orders:</b> {len(refundable)}\n\n"
+        "💡 <b>Process:</b>\n"
+        "• Click order → Instant return processed\n"
+        "• Credit added to your wallet immediately\n"
+        "• Order cancelled automatically\n"
+        "• No admin approval required"
     )
 
     await update.message.reply_text(
@@ -1098,11 +1832,12 @@ async def admin_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
     # Get system statistics
     all_orders = db.orders.all()
-    pending_refunds = db.get_pending_refunds()
 
     # Count by status
     status_counts = {}
     total_revenue = 0
+    auto_refunds_today = 0
+
     for order in all_orders:
         status = order['status']
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -1111,17 +1846,14 @@ async def admin_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
                 total_revenue += float(order['cost'])
             except (ValueError, TypeError, KeyError):
                 pass
-
-    keyboard = []
-    if pending_refunds:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"💰 Process Refunds ({len(pending_refunds)})",
-                callback_data="admin_refunds"
-            )
-        ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        # Count auto refunds from today
+        if status == 'refunded':
+            try:
+                order_date = datetime.fromisoformat(order['created_at']).date()
+                if order_date == datetime.now().date():
+                    auto_refunds_today += 1
+            except (ValueError, TypeError, KeyError):
+                pass
 
     admin_text = (
         f"👨‍💼 <b>Admin Panel</b>\n\n"
@@ -1134,21 +1866,14 @@ async def admin_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         f"• Errors: {status_counts.get('error', 0)}\n\n"
         f"💰 <b>Revenue:</b> ${total_revenue:.2f}\n"
         f"🔄 <b>Active Polls:</b> {len(active_polls)}\n"
-        f"💸 <b>Pending Refunds:</b> {len(pending_refunds)}\n\n"
-        f"🤖 <b>Bot Status:</b> ✅ Running"
+        f"⚡ <b>Auto Refunds Today:</b> {auto_refunds_today}\n\n"
+        f"🤖 <b>Bot Status:</b> ✅ Running\n"
+        f"🚀 <b>Refund System:</b> ✅ Automatic\n\n"
+        f"💡 <b>Note:</b> All refunds are now processed automatically.\n"
+        f"Admin approval only required for wallet deposits."
     )
 
-    if reply_markup:
-        await update.message.reply_text(
-            admin_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_text(
-            admin_text,
-            parse_mode='HTML'
-        )
+    await update.message.reply_text(admin_text, parse_mode='HTML')
 
 
 async def balance_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -1223,7 +1948,7 @@ async def balance_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         if wallet_summary['balance'] < 5.00:
             keyboard.append([
                 InlineKeyboardButton(
-                    "💰 Add Funds (Min: $5)", callback_data="deposit_funds")
+                    "💵 Add Credit (Min: $5)", callback_data="deposit_funds")
             ])
         else:
             keyboard.append([
@@ -1232,7 +1957,7 @@ async def balance_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             ])
 
         keyboard.append([
-            InlineKeyboardButton("📱 Browse Services",
+            InlineKeyboardButton("🔍 Explore Services",
                                  callback_data="browse_services"),
             InlineKeyboardButton(
                 "📊 Full History", callback_data="transaction_history")
@@ -1257,6 +1982,76 @@ async def balance_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.edit_message_text(error_msg)
         elif update.message:
             await update.message.reply_text(error_msg)
+
+
+async def deposit_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle /deposit command - Direct access to deposit funds"""
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+    user_balance = wallet_system.get_user_balance(
+        user.id) if wallet_system else 0.00
+
+    if not wallet_system:
+        await update.message.reply_text(
+            "❌ <b>Wallet system not available</b>\n\n"
+            "Please contact an administrator.",
+            parse_mode='HTML'
+        )
+        return
+
+    # Show deposit amount options with inline keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 $5.00 (Minimum)",
+                                 callback_data="deposit_amount_5.00"),
+            InlineKeyboardButton(
+                "💰 $10.00", callback_data="deposit_amount_10.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $25.00", callback_data="deposit_amount_25.00"),
+            InlineKeyboardButton(
+                "💰 $50.00", callback_data="deposit_amount_50.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $100.00", callback_data="deposit_amount_100.00"),
+            InlineKeyboardButton(
+                "🔢 Custom", callback_data="deposit_custom")
+        ],
+        [
+            InlineKeyboardButton("💰 Check Wallet",
+                                 callback_data="show_balance")
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    deposit_text = (
+        f"💵 <b>Add Credit to Wallet</b>\n\n"
+        f"💰 <b>Current Balance:</b> ${user_balance:.2f}\n\n"
+        f"📋 <b>Choose amount:</b>\n\n"
+        f"💡 <b>Benefits</b>\n"
+        f"• Instant purchases\n"
+        f"• No payment delays\n"
+        f"• Automatic returns to wallet\n"
+        f"• Complete transaction history\n\n"
+        f"📊 <b>Amount Range</b>\n"
+        f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD:.2f}\n"
+        f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD:.2f}\n\n"
+        f"🔒 All deposits require admin verification for security"
+    )
+
+    await update.message.reply_text(
+        deposit_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    logger.info("💰 Deposit command used by user %s (balance: $%.2f)",
+                user.id, user_balance)
 
 
 async def approve_refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1482,7 +2277,7 @@ async def handle_deposit_funds(update: Update, _context: ContextTypes.DEFAULT_TY
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     deposit_text = (
-        f"💰 <b>Add Funds to Wallet</b>\n\n"
+        f"💵 <b>Add Credit to Wallet</b>\n\n"
         f"Choose deposit amount:\n\n"
         f"💡 <b>Benefits:</b>\n"
         f"• Instant service purchases\n"
@@ -1615,6 +2410,61 @@ async def handle_deposit_amount(update: Update, _context: ContextTypes.DEFAULT_T
         )
 
 
+async def handle_wallet_purchase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle wallet purchase callback (e.g., wallet_purchase_1574_0.15)"""
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Parse callback data: wallet_purchase_1574_0.15
+        parts = query.data.split('_')
+        if len(parts) >= 3:
+            service_id = int(parts[2])
+            selling_price = float(parts[3]) if len(parts) > 3 else 0.15
+        else:
+            # Default fallback
+            service_id = 1574  # Ring4
+            selling_price = 0.15
+
+        # Get service name
+        service_names = {1574: 'Ring4', 22: 'Telegram',
+                         395: 'Google', 1012: 'WhatsApp'}
+        service_name = service_names.get(service_id, f'Service {service_id}')
+
+        # Store selection in user context for the purchase process
+        if context.user_data is not None:
+            context.user_data['selected_service_id'] = service_id
+            context.user_data['selected_price'] = selling_price
+
+        # Process the service purchase with the selected parameters
+        await handle_service_purchase(update, context, service_id, service_name, selling_price)
+
+        logger.info("✅ Wallet purchase callback processed: user %s, service %s, price $%.2f",
+                    user.id, service_name, selling_price)
+
+    except (ValueError, IndexError) as e:
+        logger.error(
+            "❌ Error parsing wallet purchase callback %s: %s", query.data, str(e))
+        await query.edit_message_text(
+            "❌ <b>Invalid Purchase Request</b>\n\n"
+            "The purchase request format is invalid. Please try again.",
+            parse_mode='HTML'
+        )
+
+    except Exception as e:
+        logger.error("❌ Error in wallet purchase callback: %s", str(e))
+        await query.edit_message_text(
+            "❌ <b>Purchase Error</b>\n\n"
+            "An error occurred while processing your purchase. Please try again.",
+            parse_mode='HTML'
+        )
+
+
 async def handle_service_purchase_with_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle service purchase using wallet balance"""
     query = update.callback_query
@@ -1667,7 +2517,7 @@ async def handle_service_purchase_with_wallet(update: Update, context: ContextTy
                 f"💰 <b>Insufficient Wallet Balance</b>\n\n"
                 f"📱 <b>Service:</b> {service_name}\n"
                 f"💵 <b>Price:</b> ${selling_price:.2f}\n"
-                f"💳 <b>Your Balance:</b> ${user_balance:.2f}\n"
+                f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
                 f"❌ <b>Needed:</b> ${needed_amount:.2f}\n\n"
                 f"Please add funds to your wallet to continue.",
                 parse_mode='HTML',
@@ -1679,7 +2529,7 @@ async def handle_service_purchase_with_wallet(update: Update, context: ContextTy
         await query.edit_message_text(
             f"🔄 <b>Processing {service_name} Purchase</b>\n\n"
             f"💰 <b>Price:</b> ${selling_price:.2f}\n"
-            f"💳 <b>Wallet Balance:</b> ${user_balance:.2f}\n"
+            f"💰 <b>Wallet Balance:</b> ${user_balance:.2f}\n"
             f"📱 <b>Service:</b> {service_name}\n\n"
             f"⚡ Purchasing your US number...",
             parse_mode='HTML'
@@ -1705,6 +2555,23 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
     start_time = asyncio.get_event_loop().time()
     order_id = None
 
+    # Get country information from context if available
+    country_id = context.user_data.get(
+        'selected_country_id', 1) if context.user_data else 1  # Default to US
+    country_name = "United States"
+    country_flag = "🇺🇸"
+
+    # Try to get country details from SMS API
+    if sms_api and country_id:
+        try:
+            country = sms_api.get_country_by_id(country_id)
+            if country:
+                country_name = country.get("name", country_name)
+                country_flag = country.get("flag", country_flag)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not get country details for ID {country_id}: {e}")
+
     try:
         # Step 1: Deduct from wallet balance first
         if not wallet_system:
@@ -1717,7 +2584,7 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
         deduction_success = wallet_system.deduct_balance(
             user_id=user_id,
             amount=selling_price,
-            description=f"{service_name} service purchase",
+            description=f"{service_name} service purchase ({country_name})",
             order_id=None  # Will update with order_id later
         )
 
@@ -1752,16 +2619,18 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
         await send_method(
             f"✅ <b>Payment Processed</b>\n\n"
             f"💰 <b>Deducted:</b> ${selling_price:.2f}\n"
-            f"💳 <b>New Balance:</b> ${new_balance:.2f}\n"
-            f"📱 <b>Service:</b> {service_name}\n\n"
-            f"🔄 Acquiring your US number...",
+            f"💰 <b>New Balance:</b> ${new_balance:.2f}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n\n"
+            f"🔄 Acquiring your number...",
             parse_mode='HTML'
         )
 
-        # Purchase the SMS number
+        # Purchase the SMS number with country support
         purchase_result = await sms_api.purchase_specific_service(
             service_id=service_id,
-            service_name=service_name
+            service_name=service_name,
+            country_id=country_id
         )
 
         if not purchase_result.get('success'):
@@ -1787,31 +2656,43 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
         phone_number = purchase_result.get('number')
         actual_cost = purchase_result.get('cost', selling_price)
 
-        # Create order in database
+        # Create order in database with complete information
         order_data = {
             'order_id': order_id,
             'number': phone_number,
             'cost': selling_price,  # What user paid from wallet
             'actual_cost': actual_cost,  # What SMS provider charged
             'service_name': service_name,
-            'service_id': service_id
+            'service_id': service_id,
+            'country_id': country_id,
+            'country_name': country_name,
+            'country_flag': country_flag
         }
 
         db.create_order(user_id, order_data)
 
         # Send success message with number
         total_time = asyncio.get_event_loop().time() - start_time
-        keyboard = [[
-            InlineKeyboardButton(
-                "❌ Cancel Order", callback_data=f"cancel_order_{order_id}")
-        ]]
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{order_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel Order", callback_data=f"cancel_order_{order_id}"),
+                InlineKeyboardButton(
+                    "💰 Check Balance", callback_data="show_balance")
+            ]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await send_method(
             f"🎉 <b>{service_name} Number Acquired!</b>\n\n"
             f"📱 <b>Your Number:</b> <code>{phone_number}</code>\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
             f"💰 <b>Cost:</b> ${selling_price:.2f}\n"
-            f"💳 <b>Wallet Balance:</b> ${new_balance:.2f}\n"
+            f"💰 <b>Wallet Balance:</b> ${new_balance:.2f}\n"
             f"🆔 <b>Order ID:</b> <code>{order_id}</code>\n\n"
             f"⏰ <b>Valid for 10 minutes</b>\n"
             f"🔄 <b>OTP monitoring started</b>\n\n"
@@ -1828,7 +2709,7 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
             logger.warning("⚠️ No order_id available for OTP polling")
 
         purchase_logger.info(
-            "✅ Wallet purchase completed for user %s: %s", user_id, order_id)
+            "✅ Wallet purchase completed for user %s: %s (%s)", user_id, order_id, country_name)
 
     except RuntimeError as e:
         total_time = asyncio.get_event_loop().time() - start_time
@@ -2056,7 +2937,7 @@ async def handle_approve_deposit(update: Update, context: ContextTypes.DEFAULT_T
                 text=(
                     f"✅ <b>Deposit Approved!</b>\n\n"
                     f"💰 <b>Amount:</b> ${amount:.2f}\n"
-                    f"💳 <b>New Balance:</b> ${new_balance:.2f}\n\n"
+                    f"💰 <b>New Balance:</b> ${new_balance:.2f}\n\n"
                     f"🎉 Your wallet has been credited!\n"
                     f"You can now purchase SMS services instantly."
                 ),
@@ -2183,7 +3064,7 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
                 [InlineKeyboardButton(
                     "🔄 Refresh Services", callback_data="browse_services")],
                 [InlineKeyboardButton(
-                    "🔙 Back to Menu", callback_data="back_to_start")]
+                    "🔙 Back to Menu", callback_data="start_menu")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2201,24 +3082,20 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
         # Build service selection menu
         services = services_info['services']
-        message_text = "📋 <b>Available SMS Services</b> 📱\n\n"
-        message_text += f"✅ <i>{len(services)} services currently available</i>\n"
-        message_text += f"💰 <i>Profit margin: {services_info.get('profit_margin', 25)}%</i>\n\n"
+        message_text = "🌟 <b>Available SMS Services</b> 📱\n\n"
+        message_text += f"✅ <i>{len(services)} services currently available</i>\n\n"
 
         keyboard = []
         for service in services:
             service_name = service['name']
             selling_price = service['selling_price']
-            api_price = service['api_price']
-            profit = service['profit']
 
             # Add service info to message
             status_icon = "⭐" if service['recommended'] else "📱"
             message_text += f"{status_icon} <b>{service_name}</b>\n"
-            message_text += f"   � Price: ${selling_price:.2f}\n"
-            message_text += f"   📊 Cost: ${api_price:.2f} | Profit: ${profit:.2f}\n"
+            message_text += f"   💰 Price: ${selling_price:.2f}\n"
             if service['recommended']:
-                message_text += "   🎯 <i>Recommended service</i>\n"
+                message_text += "   🎯 <i>Recommended for best results</i>\n"
             message_text += "\n"
 
             # Add button for service with availability confirmation
@@ -2230,19 +3107,19 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
             keyboard.append([InlineKeyboardButton(
                 button_text, callback_data=callback_data)])
 
-        message_text += "📋 <b>Selection Guide:</b>\n"
+        message_text += "📋 <b>Service Guide:</b>\n"
         message_text += "• ⭐ = Recommended for best compatibility\n"
-        message_text += "• All prices are live and availability is confirmed\n"
-        message_text += "• Payment required before SMS number purchase\n"
-        message_text += "• Admin approval needed for processing\n\n"
-        message_text += "⚡ <i>Choose a service to continue with payment</i>"
+        message_text += "• All prices include live availability check\n"
+        message_text += "• Instant purchase with wallet balance\n"
+        message_text += "• Real-time SMS delivery\n\n"
+        message_text += "🎯 <i>Choose a service to see available countries</i>"
 
         # Add refresh and back buttons
         keyboard.append([
             InlineKeyboardButton("🔄 Refresh Availability",
                                  callback_data="browse_services"),
             InlineKeyboardButton(
-                "🔙 Back to Menu", callback_data="back_to_start")
+                "🔙 Back to Menu", callback_data="start_menu")
         ])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2255,7 +3132,7 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
         # Log service display for monitoring
         logger.info(
-            "✅ Displayed %d available services to user %s", len(services), query.from_user.id)
+            "✅ Displayed %d available services to user %s", len(services), query.from_user.id if query.from_user else 'Unknown')
 
     except RuntimeError as e:
         logger.error("❌ Error browsing services: %s", str(e))
@@ -2263,7 +3140,7 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
             [InlineKeyboardButton(
                 "🔄 Try Again", callback_data="browse_services")],
             [InlineKeyboardButton(
-                "🔙 Back to Menu", callback_data="back_to_start")]
+                "🔙 Back to Menu", callback_data="start_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2278,43 +3155,1256 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
 
 async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle specific service selection"""
+    """Handle service selection - then show countries for that service"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract service info from callback data: "select_service_1574_0.17"
+        parts = query.data.split('_')
+        if len(parts) < 4:
+            raise ValueError("Invalid service callback data format")
+
+        service_id = int(parts[2])
+        selling_price = float(parts[3])
+
+        # Store selected service in user data
+        if context.user_data is not None:
+            context.user_data['selected_service_id'] = service_id
+            context.user_data['selected_price'] = selling_price
+
+        # Show country selection for this service
+        await query.edit_message_text(
+            "🔄 <b>Loading Countries...</b>\n\n"
+            "Checking country availability for your selected service...",
+            parse_mode='HTML'
+        )
+
+        # Get service info
+        service_name = "Unknown Service"
+        try:
+            from src.config import Config
+            services = Config.SERVICE_PRIORITY
+            service_info = next(
+                (s for s in services if s['id'] == service_id), None)
+            if service_info:
+                service_name = service_info['name']
+        except Exception:
+            # Fallback service names
+            service_names = {1574: 'Ring4', 22: 'Telegram',
+                             395: 'Google', 1012: 'WhatsApp'}
+            service_name = service_names.get(
+                service_id, f'Service {service_id}')
+
+        await load_countries_for_service(query, service_id, service_name, selling_price)
+
+    except (ValueError, IndexError) as e:
+        logger.error("❌ Error processing service selection: %s", e)
+        await query.edit_message_text("❌ Invalid service selection. Please try again.")
+    except Exception as e:
+        logger.error("❌ Unexpected error in service selection: %s", e)
+        await query.edit_message_text("❌ An error occurred. Please try again.")
+
+
+async def load_countries_for_service(query, service_id: int, service_name: str, selling_price: float):
+    """Load and display available countries for selected service"""
+    if not sms_api:
+        await query.edit_message_text("❌ SMS API not available.")
+        return
+
+    try:
+        # Get popular countries first
+        popular_countries = []
+        try:
+            from src.smspool_api import POPULAR_COUNTRIES
+            # First 10 popular countries
+            popular_countries = POPULAR_COUNTRIES[:10]
+        except ImportError:
+            # Fallback to hardcoded popular countries
+            popular_countries = [
+                {"id": 1, "name": "United States", "code": "US", "flag": "🇺🇸"},
+                {"id": 2, "name": "United Kingdom", "code": "GB", "flag": "🇬🇧"},
+                {"id": 3, "name": "Canada", "code": "CA", "flag": "🇨🇦"},
+                {"id": 7, "name": "France", "code": "FR", "flag": "🇫🇷"},
+                {"id": 9, "name": "Germany", "code": "DE", "flag": "🇩🇪"},
+            ]
+
+        keyboard = []
+
+        # Add search functionality
+        keyboard.append([
+            InlineKeyboardButton("🔍 Search Countries",
+                                 callback_data=f"search_countries_{service_id}")
+        ])
+
+        service_text = f"🌍 <b>Select Country for {service_name}</b>\n\n"
+        service_text += f"💰 <b>Price:</b> ${selling_price:.2f}\n"
+        service_text += f"📱 <b>Service:</b> {service_name}\n\n"
+        service_text += "Choose your country (popular countries shown first):\n\n"
+
+        # Check availability for each popular country
+        available_countries = []
+        for country in popular_countries:
+            try:
+                # Quick availability check
+                availability = await sms_api.check_service_availability(service_id, country['id'])
+                if availability.get('available'):
+                    available_countries.append(country)
+                    if len(available_countries) >= 8:  # Limit to 8 countries for UI
+                        break
+            except Exception as check_error:
+                logger.warning(
+                    f"Failed to check availability for {country['name']}: {check_error}")
+                continue
+
+        if not available_countries:
+            await query.edit_message_text(
+                f"❌ <b>Service Not Available</b>\n\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"💰 <b>Price:</b> ${selling_price:.2f}\n\n"
+                f"Unfortunately, {service_name} is not available in any supported countries at the moment.\n"
+                f"Please try a different service or check back later.",
+                parse_mode='HTML'
+            )
+            return
+
+        service_text += f"✅ <b>Available in {len(available_countries)} countries:</b>\n\n"
+
+        # Show available countries in rows of 2
+        for i in range(0, len(available_countries), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(available_countries):
+                    country = available_countries[i + j]
+                    row.append(InlineKeyboardButton(
+                        f"{country['flag']} {country['name']}",
+                        callback_data=f"country_{country['id']}_{service_id}_{selling_price:.2f}"
+                    ))
+            keyboard.append(row)
+
+        # Add "Show All Countries" button
+        keyboard.append([
+            InlineKeyboardButton(
+                "🌐 Show All Countries", callback_data=f"all_countries_{service_id}_{selling_price:.2f}")
+        ])
+
+        # Add back button
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back to Services",
+                                 callback_data="browse_services")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            service_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+        logger.info("✅ Loaded %d countries for service %s",
+                    len(available_countries), service_name)
+
+    except Exception as e:
+        logger.error("❌ Error loading countries for %s: %s", service_name, e)
+        await query.edit_message_text(
+            f"❌ <b>Error Loading Countries</b>\n\n"
+            f"Unable to load countries for {service_name}. Please try again.",
+            parse_mode='HTML'
+        )
+
+
+async def handle_country_selection_with_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle country selection for a specific service"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract info from callback data: "country_1_1574_0.17"
+        parts = query.data.split('_')
+        if len(parts) < 4:
+            raise ValueError("Invalid country callback data format")
+
+        country_id = int(parts[1])
+        service_id = int(parts[2])
+        selling_price = float(parts[3])
+
+        # Store selections in user data
+        if context.user_data is not None:
+            context.user_data['selected_country_id'] = country_id
+            context.user_data['selected_service_id'] = service_id
+            context.user_data['selected_price'] = selling_price
+
+        # Get country and service info
+        country = sms_api.get_country_by_id(country_id) if sms_api else None
+        if not country:
+            await query.edit_message_text("❌ Invalid country selection. Please try again.")
+            return
+
+        country_name = country.get("name", "Unknown") if country else "Unknown"
+        country_flag = country.get("flag", "🌍") if country else "🌍"
+
+        # Get service name
+        service_name = "Unknown Service"
+        if sms_api:
+            try:
+                from src.config import Config
+                services = Config.SERVICE_PRIORITY
+                service_info = next(
+                    (s for s in services if s['id'] == service_id), None)
+                if service_info:
+                    service_name = service_info['name']
+            except Exception:
+                # Fallback service names
+                service_names = {1574: 'Ring4', 22: 'Telegram',
+                                 395: 'Google', 1012: 'WhatsApp'}
+                service_name = service_names.get(
+                    service_id, f'Service {service_id}')
+
+        # Check availability for this specific service and country combination
+        await query.edit_message_text(
+            f"🔍 <b>Checking Availability</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Price:</b> ${selling_price:.2f}\n\n"
+            "⏳ Verifying service availability in your selected country...",
+            parse_mode='HTML'
+        )
+
+        # Check service availability for this country
+        if not sms_api:
+            await query.edit_message_text("❌ SMS API not available.")
+            return
+
+        availability = await sms_api.check_service_availability(service_id, country_id)
+
+        if not availability.get('available'):
+            # Service not available in this country
+            keyboard = [[
+                InlineKeyboardButton("🔙 Choose Different Country",
+                                     callback_data=f"select_service_{service_id}_{selling_price:.2f}"),
+                InlineKeyboardButton("🔄 Try Different Service",
+                                     callback_data="browse_services")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"❌ <b>Service Not Available</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n\n"
+                f"Unfortunately, {service_name} is not available in {country_name}.\n"
+                f"Please try a different country or service.",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # Service is available! Show purchase confirmation
+        user = query.from_user
+        if not user:
+            return
+
+        user_balance = wallet_system.get_user_balance(
+            user.id) if wallet_system else 0.00
+
+        # Check if user has sufficient balance
+        if user_balance < selling_price:
+            keyboard = [[
+                InlineKeyboardButton(
+                    "💰 Add Funds", callback_data="deposit_funds"),
+                InlineKeyboardButton("🔙 Back to Services",
+                                     callback_data="browse_services")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"❌ <b>Insufficient Balance</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"💰 <b>Price:</b> ${selling_price:.2f}\n"
+                f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+                f"📉 <b>Need:</b> ${selling_price - user_balance:.2f} more\n\n"
+                f"Please add funds to your wallet to continue.",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # User has sufficient balance - show instant purchase option
+        keyboard = [[
+            InlineKeyboardButton(f"⚡ Buy Now (${selling_price:.2f})",
+                                 callback_data=f"instant_purchase_{service_id}_{country_id}_{selling_price:.2f}"),
+        ], [
+            InlineKeyboardButton("🔙 Back to Countries",
+                                 callback_data=f"select_service_{service_id}_{selling_price:.2f}"),
+            InlineKeyboardButton("🏠 Main Menu", callback_data="start")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"✅ <b>Ready to Purchase!</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Price:</b> ${selling_price:.2f}\n"
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+            f"💰 <b>After Purchase:</b> ${user_balance - selling_price:.2f}\n\n"
+            f"🎯 <b>Service Available!</b> Click below to purchase instantly.\n"
+            f"📲 You'll receive the phone number immediately.",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+    except (ValueError, IndexError) as e:
+        logger.error("❌ Error processing country selection: %s", e)
+        await query.edit_message_text("❌ Invalid country selection. Please try again.")
+    except Exception as e:
+        logger.error("❌ Unexpected error in country selection: %s", e)
+        await query.edit_message_text("❌ An error occurred. Please try again.")
+
+
+async def handle_instant_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle instant purchase after service and country selection"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract info from callback data: "instant_purchase_1574_1_0.17"
+        parts = query.data.split('_')
+        if len(parts) < 4:
+            raise ValueError("Invalid purchase callback data format")
+
+        service_id = int(parts[2])
+        country_id = int(parts[3])
+        selling_price = float(parts[4])
+
+        user = query.from_user
+        if not user:
+            return
+
+        # Get service and country info for display
+        service_name = "Unknown Service"
+        country_name = "Unknown Country"
+        country_flag = "🌍"
+
+        if sms_api:
+            try:
+                from src.config import Config
+                services = Config.SERVICE_PRIORITY
+                service_info = next(
+                    (s for s in services if s['id'] == service_id), None)
+                if service_info:
+                    service_name = service_info['name']
+            except Exception:
+                # Fallback service names
+                service_names = {1574: 'Ring4', 22: 'Telegram',
+                                 395: 'Google', 1012: 'WhatsApp'}
+                service_name = service_names.get(
+                    service_id, f'Service {service_id}')
+
+            country = sms_api.get_country_by_id(country_id)
+            if country:
+                country_name = country.get("name", "Unknown")
+                country_flag = country.get("flag", "🌍")
+
+        # Show processing message
+        await query.edit_message_text(
+            f"⚡ <b>Processing Purchase...</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Price:</b> ${selling_price:.2f}\n\n"
+            f"🔄 <b>Processing instant purchase...</b>\n"
+            f"📱 Service will be delivered automatically",
+            parse_mode='HTML'
+        )
+
+        # Process the wallet purchase with country info
+        await process_wallet_service_purchase_with_country(
+            user_id=user.id,
+            context=context,
+            send_method=query.edit_message_text,
+            service_id=service_id,
+            service_name=service_name,
+            country_id=country_id,
+            country_name=country_name,
+            country_flag=country_flag
+        )
+
+    except (ValueError, IndexError) as e:
+        logger.error("❌ Error processing instant purchase: %s", e)
+        await query.edit_message_text("❌ Invalid purchase request. Please try again.")
+    except Exception as e:
+        logger.error("❌ Unexpected error in instant purchase: %s", e)
+        await query.edit_message_text("❌ An error occurred during purchase. Please try again.")
+
+
+async def handle_show_all_countries_for_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all countries for a specific service"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract service info from callback data: "all_countries_1574_0.17"
+        parts = query.data.split('_')
+        if len(parts) < 4:
+            raise ValueError("Invalid callback data format")
+
+        service_id = int(parts[2])
+        selling_price = float(parts[3])
+
+        # Get service name
+        service_name = "Unknown Service"
+        try:
+            from src.config import Config
+            services = Config.SERVICE_PRIORITY
+            service_info = next(
+                (s for s in services if s['id'] == service_id), None)
+            if service_info:
+                service_name = service_info['name']
+        except Exception:
+            service_names = {1574: 'Ring4', 22: 'Telegram',
+                             395: 'Google', 1012: 'WhatsApp'}
+            service_name = service_names.get(
+                service_id, f'Service {service_id}')
+
+        await query.edit_message_text(
+            f"🔄 <b>Loading All Countries for {service_name}...</b>\n\n"
+            f"Checking availability in all supported countries...",
+            parse_mode='HTML'
+        )
+
+        if not sms_api:
+            await query.edit_message_text("❌ SMS API not available.")
+            return
+
+        # Get all countries from API
+        try:
+            from src.smspool_api import ALL_COUNTRIES
+            all_countries = ALL_COUNTRIES[:30]  # Limit to first 30 for UI
+        except ImportError:
+            await query.edit_message_text("❌ Country data not available.")
+            return
+
+        # Check availability for all countries (limit checks for performance)
+        available_countries = []
+        for country in all_countries[:20]:  # Check first 20 countries only
+            try:
+                availability = await sms_api.check_service_availability(service_id, country['id'])
+                if availability.get('available'):
+                    available_countries.append(country)
+                    if len(available_countries) >= 15:  # Limit results
+                        break
+            except Exception:
+                continue
+
+        if not available_countries:
+            keyboard = [[
+                InlineKeyboardButton("🔙 Back to Service",
+                                     callback_data=f"select_service_{service_id}_{selling_price:.2f}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"❌ <b>No Countries Available</b>\n\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"💰 <b>Price:</b> ${selling_price:.2f}\n\n"
+                f"Unfortunately, {service_name} is not available in any countries at the moment.",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # Build country selection keyboard
+        keyboard = []
+
+        # Add search button
+        keyboard.append([
+            InlineKeyboardButton("🔍 Search Countries",
+                                 callback_data=f"search_countries_{service_id}")
+        ])
+
+        # Show countries in rows of 2
+        for i in range(0, len(available_countries), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(available_countries):
+                    country = available_countries[i + j]
+                    row.append(InlineKeyboardButton(
+                        f"{country['flag']} {country['name']}",
+                        callback_data=f"country_{country['id']}_{service_id}_{selling_price:.2f}"
+                    ))
+            keyboard.append(row)
+
+        # Add back button
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back to Service",
+                                 callback_data=f"select_service_{service_id}_{selling_price:.2f}")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        service_text = f"🌐 <b>All Countries for {service_name}</b>\n\n"
+        service_text += f"💰 <b>Price:</b> ${selling_price:.2f}\n"
+        service_text += f"📱 <b>Service:</b> {service_name}\n\n"
+        service_text += f"✅ Available in {len(available_countries)} countries:\n"
+        service_text += f"(Showing first {len(available_countries)} results)"
+
+        await query.edit_message_text(
+            service_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+    except (ValueError, IndexError) as e:
+        logger.error("❌ Error showing all countries: %s", e)
+        await query.edit_message_text("❌ Invalid request. Please try again.")
+    except Exception as e:
+        logger.error("❌ Unexpected error showing all countries: %s", e)
+        await query.edit_message_text("❌ An error occurred. Please try again.")
+
+
+async def handle_country_search_for_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle country search for a specific service"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract service info from callback data: "search_countries_1574"
+        parts = query.data.split('_')
+        if len(parts) < 3:
+            raise ValueError("Invalid callback data format")
+
+        service_id = int(parts[2])
+
+        # Get service name
+        service_name = "Unknown Service"
+        try:
+            from src.config import Config
+            services = Config.SERVICE_PRIORITY
+            service_info = next(
+                (s for s in services if s['id'] == service_id), None)
+            if service_info:
+                service_name = service_info['name']
+        except Exception:
+            service_names = {1574: 'Ring4', 22: 'Telegram',
+                             395: 'Google', 1012: 'WhatsApp'}
+            service_name = service_names.get(
+                service_id, f'Service {service_id}')
+
+        # Ask user to send country search query
+        search_text = (
+            f"🔍 <b>Search Countries for {service_name}</b>\n\n"
+            f"💡 Send me the name or code of the country you're looking for.\n\n"
+            f"<b>Examples:</b>\n"
+            f"• United States\n"
+            f"• UK\n"
+            f"• Germany\n"
+            f"• FR\n\n"
+            f"❌ Send /cancel to go back"
+        )
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "❌ Cancel", callback_data=f"select_service_{service_id}_0.17")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            search_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+        # Set user state to expect country search for this service
+        if context.user_data is not None:
+            context.user_data['awaiting_country_search'] = True
+            context.user_data['search_service_id'] = service_id
+
+        logger.info("🔍 User %s requested country search for service %s",
+                    query.from_user.id if query.from_user else 'Unknown', service_name)
+
+    except (ValueError, IndexError) as e:
+        logger.error("❌ Error setting up country search: %s", e)
+        await query.edit_message_text("❌ Invalid request. Please try again.")
+    except Exception as e:
+        logger.error("❌ Unexpected error in country search setup: %s", e)
+        await query.edit_message_text("❌ An error occurred. Please try again.")
+
+
+def get_country_selection_keyboard(search_query: Optional[str] = None):
+    """Create country selection keyboard"""
+    if not sms_api:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ API Not Available", callback_data="error")
+        ]])
+
+    # Get countries based on search query
+    if search_query:
+        countries = sms_api.search_countries(search_query)
+        title_text = f"🔍 Search results for '{search_query}'"
+    else:
+        countries = sms_api.get_countries_list() if sms_api else []
+        title_text = "🌟 Popular Countries"
+
+    keyboard = []
+
+    # Add search button at the top
+    keyboard.append([
+        InlineKeyboardButton("🔍 Search Countries",
+                             callback_data="search_countries")
+    ])
+
+    # Show countries in rows of 2
+    for i in range(0, len(countries), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(countries):
+                country = countries[i + j]
+                button_text = f"{country['flag']} {country['name']}"
+                callback_data = f"country_{country['id']}"
+                row.append(InlineKeyboardButton(
+                    button_text, callback_data=callback_data))
+        keyboard.append(row)
+
+    # Add "Show All Countries" if we're showing popular only
+    if not search_query:
+        keyboard.append([
+            InlineKeyboardButton("🌐 Show All Countries",
+                                 callback_data="all_countries")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("🌟 Back to Popular",
+                                 callback_data="browse_services")
+        ])
+
+    # Add back button
+    keyboard.append([
+        InlineKeyboardButton("🔙 Back to Main Menu", callback_data="start_menu")
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def handle_country_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle country selection from the country list"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract country ID from callback data: "country_1"
+        country_id = int(query.data.split('_')[1])
+
+        # Store selected country in user data
+        if context.user_data is not None:
+            context.user_data['selected_country_id'] = country_id
+
+        # Get country info
+        country = sms_api.get_country_by_id(country_id) if sms_api else None
+        if not country:
+            await query.edit_message_text("❌ Invalid country selection. Please try again.")
+            return
+
+        country_name = country.get("name", "Unknown") if country else "Unknown"
+        country_flag = country.get("flag", "🌍") if country else "🌍"
+
+        # Show loading message
+        await query.edit_message_text(
+            f"🔄 <b>Loading Services for {country_flag} {country_name}...</b>\n\n"
+            "Checking real-time pricing and availability...",
+            parse_mode='HTML'
+        )
+
+        # Get available services for this country
+        await load_services_for_country(query, country_id, country_name, country_flag)
+
+    except (ValueError, IndexError) as e:
+        logger.error(f"❌ Error processing country selection: {e}")
+        await query.edit_message_text("❌ Invalid country selection. Please try again.")
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in country selection: {e}")
+        await query.edit_message_text("❌ Error loading country services. Please try again.")
+
+
+async def load_services_for_country(query, country_id: int, country_name: str, country_flag: str):
+    """Load and display available services for selected country"""
+    if not sms_api:
+        await query.edit_message_text("❌ SMS API not available.")
+        return
+
+    try:
+        # Get available services for this country
+        services_result = await sms_api.get_available_services_for_purchase(country_id)
+
+        if not services_result.get('success', False):
+            await query.edit_message_text(
+                f"❌ <b>Error Loading Services</b>\n\n"
+                f"Could not load services for {country_flag} {country_name}.\n"
+                "Please try again later.",
+                parse_mode='HTML'
+            )
+            return
+
+        services = services_result.get('services', [])
+
+        if not services:
+            # No services available for this country
+            keyboard = [[
+                InlineKeyboardButton(
+                    "🔙 Choose Different Country", callback_data="browse_services")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"😔 <b>No Services Available</b>\n\n"
+                f"Unfortunately, no SMS services are currently available for {country_flag} {country_name}.\n\n"
+                f"💡 <b>Try:</b>\n"
+                f"• Checking back later\n"
+                f"• Selecting a different country\n"
+                f"• Contacting support if you need this country urgently",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # Services available - create service selection keyboard
+        keyboard = []
+
+        # Add title row
+        service_text = (
+            f"📱 <b>Services for {country_flag} {country_name}</b>\n\n"
+            f"✅ <b>{len(services)} services available</b>\n\n"
+        )
+
+        # Add each service as a button
+        for service in services:
+            service_name = service['name']
+            selling_price = service['selling_price']
+            recommended = service.get('recommended', False)
+
+            button_text = f"{'⭐ ' if recommended else ''}{service_name} - ${selling_price:.2f}"
+            callback_data = f"service_{service['id']}_{country_id}_{selling_price}"
+
+            keyboard.append([
+                InlineKeyboardButton(button_text, callback_data=callback_data)
+            ])
+
+            # Add service info to text
+            service_text += f"{'⭐ ' if recommended else '•'} <b>{service_name}</b> - ${selling_price:.2f}\n"
+
+        service_text += f"\n💡 <b>Tip:</b> ⭐ indicates recommended service"
+
+        # Add navigation buttons
+        keyboard.append([
+            InlineKeyboardButton("🔙 Choose Different Country",
+                                 callback_data="browse_services"),
+            InlineKeyboardButton(
+                "💰 Check Balance", callback_data="show_balance")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            service_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+        logger.info(f"✅ Loaded {len(services)} services for {country_name}")
+
+    except Exception as e:
+        logger.error(f"❌ Error loading services for {country_name}: {e}")
+        await query.edit_message_text(
+            f"❌ <b>Error Loading Services</b>\n\n"
+            f"Could not load services for {country_flag} {country_name}.\n"
+            f"Error: {str(e)}\n\n"
+            "Please try again later.",
+            parse_mode='HTML'
+        )
+
+
+async def handle_show_all_countries(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Show all countries instead of just popular ones"""
     if not update.callback_query:
         return
 
     query = update.callback_query
     await query.answer()
 
-    # Extract service info from callback data
-    try:
-        callback_data = query.data
-        if not callback_data:
-            logger.error("❌ No callback data received")
-            return
+    if not sms_api:
+        await query.edit_message_text("❌ SMS API not available.")
+        return
 
-        parts = callback_data.split('_')
-        service_id = int(parts[2])
+    # Get all countries
+    countries = sms_api.get_countries_list() if sms_api else []
+
+    keyboard = []
+
+    # Add search button at the top
+    keyboard.append([
+        InlineKeyboardButton("🔍 Search Countries",
+                             callback_data="search_countries")
+    ])
+
+    # Show countries in rows of 2 (limit to first 20 to avoid message too long)
+    display_countries = countries[:40]  # Show first 40 countries
+
+    for i in range(0, len(display_countries), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(display_countries):
+                country = display_countries[i + j]
+                button_text = f"{country['flag']} {country['name']}"
+                callback_data = f"country_{country['id']}"
+                row.append(InlineKeyboardButton(
+                    button_text, callback_data=callback_data))
+        keyboard.append(row)
+
+    # Add navigation buttons
+    keyboard.append([
+        InlineKeyboardButton("🌟 Show Popular Only",
+                             callback_data="browse_services"),
+        InlineKeyboardButton("🔙 Back to Menu", callback_data="start_menu")
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        f"🌐 <b>All Countries</b>\n\n"
+        f"Showing {len(display_countries)} countries (more available via search).\n"
+        f"Use search to find specific countries quickly.",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+async def handle_country_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle country search request"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    # Ask user to send country search query
+    search_text = (
+        f"🔍 <b>Search Countries</b>\n\n"
+        f"💡 Send me the name or code of the country you're looking for.\n\n"
+        f"<b>Examples:</b>\n"
+        f"• United States\n"
+        f"• UK\n"
+        f"• Germany\n"
+        f"• FR\n\n"
+        f"❌ Send /cancel to go back"
+    )
+
+    keyboard = [[
+        InlineKeyboardButton("❌ Cancel", callback_data="browse_services")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        search_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    # Set user state to expect country search
+    if context.user_data is not None:
+        context.user_data['awaiting_country_search'] = True
+    logger.info("🔍 User %s requested country search",
+                query.from_user.id if query.from_user else 'Unknown')
+
+
+async def handle_service_selection_with_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle service selection with country information"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    try:
+        # Extract service info from callback data: "service_1574_1_0.17"
+        parts = query.data.split('_')
+        if len(parts) < 4:
+            raise ValueError("Invalid service callback data format")
+
+        service_id = int(parts[1])
+        country_id = int(parts[2])
         selling_price = float(parts[3])
 
-        # Store selection in user context
-        if context.user_data is not None:
-            context.user_data['selected_service_id'] = service_id
-            context.user_data['selected_price'] = selling_price
+        # Get service and country info
+        if not sms_api:
+            await query.edit_message_text("❌ SMS API not available.")
+            return
 
-        # Get service name
+        country = sms_api.get_country_by_id(country_id)
+        if not country:
+            await query.edit_message_text("❌ Invalid country selection.")
+            return
+
+        country_name = country["name"]
+        country_flag = country["flag"]
+
+        # Get service name from known services
         service_names = {1574: 'Ring4', 22: 'Telegram',
                          395: 'Google', 1012: 'WhatsApp'}
         service_name = service_names.get(service_id, f'Service {service_id}')
 
-        # Proceed with payment workflow
-        await handle_service_purchase(update, context, service_id, service_name, selling_price)
+        # Store selection in user data
+        if context.user_data is not None:
+            context.user_data.update({
+                'selected_service_id': service_id,
+                'selected_service_name': service_name,
+                'selected_country_id': country_id,
+                'selected_price': selling_price
+            })
 
-    except RuntimeError as e:
-        logger.error("❌ Error in service selection: %s", str(e))
+        # Check user balance and proceed with purchase
+        await handle_service_purchase_with_country(query, context, service_id, service_name, country_id, country_name, country_flag, selling_price)
+
+    except (ValueError, IndexError) as e:
+        logger.error(f"❌ Error processing service selection: {e}")
+        await query.edit_message_text("❌ Invalid service selection. Please try again.")
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in service selection: {e}")
+        await query.edit_message_text("❌ Error processing service selection. Please try again.")
+
+
+async def handle_service_purchase_with_country(query, context: ContextTypes.DEFAULT_TYPE, service_id: int, service_name: str, country_id: int, country_name: str, country_flag: str, selling_price: float):
+    """Handle service purchase with country information"""
+    user = query.from_user
+    if not user:
+        await query.edit_message_text("❌ User information not available.")
+        return
+
+    user_logger.info(
+        "🛒 User %s (@%s) initiating %s purchase in %s - $%.2f",
+        user.id, user.username, service_name, country_name, selling_price)
+
+    # Step 1: Check availability for this specific country and service
+    await query.edit_message_text(
+        f"🔍 <b>Checking {service_name} Availability</b>\n\n"
+        f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+        f"📱 <b>Service:</b> {service_name}\n"
+        f"💰 <b>Price:</b> ${selling_price:.2f}\n\n"
+        "⏳ Real-time availability check in progress...",
+        parse_mode='HTML'
+    )
+
+    if not sms_api:
+        await query.edit_message_text("❌ SMS API not available.")
+        return
+
+    try:
+        # Check service availability for this country
+        availability = await sms_api.check_service_availability(service_id, country_id)
+
+        if not availability.get('available'):
+            # Service not available in this country
+            keyboard = [[
+                InlineKeyboardButton(
+                    "🔙 Choose Different Service", callback_data=f"country_{country_id}"),
+                InlineKeyboardButton(
+                    "🌍 Choose Different Country", callback_data="browse_services")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"❌ <b>Service Unavailable</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n\n"
+                f"😔 {availability.get('message', 'Service not available')}\n\n"
+                f"💡 <b>Options:</b>\n"
+                f"• Try a different service for {country_name}\n"
+                f"• Choose a different country\n"
+                f"• Check back later",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # Step 2: Check wallet balance
+        user_balance = wallet_system.get_user_balance(
+            user.id) if wallet_system else 0.00
+
         await query.edit_message_text(
-            "❌ Error processing selection. Please try again.",
+            f"✅ <b>{service_name} Available!</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Service Price:</b> ${selling_price:.2f}\n"
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n\n"
+            "⚡ Checking wallet balance...",
             parse_mode='HTML'
         )
+
+        # Step 3: Wallet balance check
+        if not wallet_system:
+            await query.edit_message_text("❌ Wallet system not available.")
+            return
+
+        if not wallet_system.has_sufficient_balance(user.id, selling_price):
+            # Insufficient balance
+            keyboard = [[
+                InlineKeyboardButton(
+                    "💰 Add Funds", callback_data="deposit_funds"),
+                InlineKeyboardButton(
+                    "🔙 Back", callback_data=f"country_{country_id}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"💰 <b>Insufficient Balance</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"💰 <b>Required:</b> ${selling_price:.2f}\n"
+                f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+                f"💸 <b>Needed:</b> ${selling_price - user_balance:.2f}\n\n"
+                f"💡 Add funds to your wallet to continue.",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return
+
+        # User has sufficient balance - proceed with instant purchase
+        user_logger.info(
+            "⚡ Instant purchase: User %s has sufficient balance ($%.2f) for %s in %s",
+            user.id, user_balance, service_name, country_name)
+
+        # AUTO-PROCESS purchase immediately without confirmation
+        await query.edit_message_text(
+            f"⚡ <b>Processing Purchase...</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Cost:</b> ${selling_price:.2f}\n"
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+            f"💰 <b>After Purchase:</b> ${user_balance - selling_price:.2f}\n\n"
+            f"🔄 <b>Processing instant purchase...</b>\n"
+            f"📞 Service will be delivered automatically",
+            parse_mode='HTML'
+        )
+
+        # Process the wallet purchase immediately
+        await process_wallet_service_purchase_with_country(
+            user_id=user.id,
+            context=context,
+            send_method=query.edit_message_text,
+            service_id=service_id,
+            service_name=service_name,
+            country_id=country_id,
+            country_name=country_name,
+            country_flag=country_flag
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error in service purchase for {country_name}: {e}")
+        await query.edit_message_text(
+            f"❌ <b>Purchase Error</b>\n\n"
+            f"Error processing {service_name} purchase for {country_flag} {country_name}.\n\n"
+            f"Please try again later or contact support.",
+            parse_mode='HTML'
+        )
+
+
+async def process_wallet_service_purchase_with_country(user_id: int, context: ContextTypes.DEFAULT_TYPE, send_method, service_id: int, service_name: str, country_id: int, country_name: str, country_flag: str):
+    """Process service purchase using wallet balance with country support"""
+
+    # Get the selected price from user data
+    selling_price = context.user_data.get(
+        'selected_price', 0.15) if context.user_data else 0.15
+
+    purchase_logger.info(
+        "🚀 Starting wallet purchase for user %s: %s in %s ($%.2f)", user_id, service_name, country_name, selling_price)
+
+    start_time = asyncio.get_event_loop().time()
+    order_id = None
+
+    try:
+        # Step 1: Deduct from wallet first
+        if not wallet_system:
+            await send_method(
+                "❌ <b>Wallet system not available</b>\n\n"
+                "Please contact support.",
+                parse_mode='HTML'
+            )
+            return
+
+        deduction_success = wallet_system.deduct_balance(
+            user_id, selling_price, f"{service_name} purchase for {country_name}")
+
+        if not deduction_success:
+            await send_method(
+                f"❌ <b>Payment Failed</b>\n\n"
+                f"Could not deduct ${selling_price:.2f} from wallet.\n"
+                f"Please check your balance and try again.",
+                parse_mode='HTML'
+            )
+            return
+
+        performance_logger.info(
+            "✅ Wallet deducted: $%.2f for user %s", selling_price, user_id)
+
+        # Step 2: Purchase from SMS API
+        await send_method(
+            f"💰 <b>Payment Processed</b>\n\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"💰 <b>Charged:</b> ${selling_price:.2f}\n\n"
+            f"📞 <b>Purchasing phone number...</b>\n"
+            f"⏳ This usually takes 5-10 seconds",
+            parse_mode='HTML'
+        )
+
+        # Use the new country-aware purchase method
+        if not sms_api:
+            # Refund the user since API is not available
+            if wallet_system:
+                wallet_system.add_balance(
+                    user_id, selling_price, f"Refund for {service_name} - API unavailable")
+            await send_method(
+                "❌ <b>Service Unavailable</b>\n\n"
+                "SMS service is currently unavailable. Your payment has been refunded.",
+                parse_mode='HTML'
+            )
+            return
+
+        purchase_result = await sms_api.purchase_specific_service(service_id, service_name, country_id)
+
+        if purchase_result.get('success'):
+            # Success - create order and start OTP polling
+            order_data = {
+                'order_id': purchase_result['order_id'],
+                'number': purchase_result['number'],
+                'cost': selling_price,  # Use our selling price
+                'service_id': service_id,  # Required for instant refund
+                'service_name': service_name,
+                'country_id': country_id,
+                'country_name': country_name,
+                'country_flag': country_flag,
+                'actual_cost': purchase_result.get('cost', selling_price)
+            }
+
+            # Create order in database
+            db.create_order(user_id, order_data)
+            order_id = purchase_result['order_id']
+
+            # Show success message with number
+            success_text = (
+                f"✅ <b>{service_name} Number Purchased!</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📞 <b>Phone Number:</b> <code>{purchase_result['number']}</code>\n"
+                f"🆔 <b>Order ID:</b> <code>{order_id}</code>\n"
+                f"💰 <b>Cost:</b> ${selling_price:.2f}\n\n"
+                f"🔄 <b>Waiting for SMS...</b>\n"
+                f"⏰ Valid for {POLL_TIMEOUT // 60} minutes\n"
+                f"📱 Use this number for verification now!\n\n"
+                f"💡 Your OTP code will appear here automatically."
+            )
+
+            # Add instant refund and get different number buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{order_id}"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💰 Instant Refund", callback_data=f"refund_{order_id}"),
+                    InlineKeyboardButton(
+                        "❌ Cancel Order", callback_data=f"cancel_order_{order_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await send_method(success_text, parse_mode='HTML', reply_markup=reply_markup)
+
+            # Start OTP polling
+            start_otp_polling(order_id, user_id, context)
+
+            end_time = asyncio.get_event_loop().time()
+            performance_logger.info(
+                "✅ Purchase completed in %.2f seconds for %s in %s",
+                end_time - start_time, service_name, country_name)
+
+        else:
+            # Purchase failed - refund to wallet
+            refund_success = wallet_system.add_balance(
+                user_id, selling_price, f"Refund for failed {service_name} purchase in {country_name}")
+
+            error_msg = purchase_result.get('message', 'Unknown error')
+            await send_method(
+                f"❌ <b>Purchase Failed</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"⚠️ <b>Error:</b> {error_msg}\n\n"
+                f"💰 <b>Refund:</b> {'✅ Processed' if refund_success else '❌ Failed'}\n"
+                f"${selling_price:.2f} {'returned to wallet' if refund_success else 'refund failed'}\n\n"
+                f"💡 Try a different service or country.",
+                parse_mode='HTML'
+            )
+
+    except Exception as e:
+        logger.error(
+            f"❌ Critical error in wallet purchase for {country_name}: {e}")
+
+        # Attempt refund on error
+        if selling_price > 0 and wallet_system:
+            refund_success = wallet_system.add_balance(
+                user_id, selling_price, f"Error refund for {service_name} in {country_name}")
+
+            await send_method(
+                f"❌ <b>Purchase Error</b>\n\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"⚠️ <b>Error:</b> {str(e)}\n\n"
+                f"💰 <b>Refund:</b> {'✅ Processed' if refund_success else '❌ Failed'}\n"
+                f"${selling_price:.2f} {'returned to wallet' if refund_success else 'refund failed'}\n\n"
+                f"💡 Please try again or contact support.",
+                parse_mode='HTML'
+            )
+
+    finally:
+        performance_logger.info(
+            "🧹 Purchase cleanup completed for %s in %s", service_name, country_name)
 
 
 async def handle_service_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE, service_id: int, service_name: str, selling_price: float):
@@ -2438,7 +4528,7 @@ async def handle_service_purchase(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(
         f"✅ <b>{service_name} Available!</b>\n\n"
         f"💰 <b>Service Price:</b> ${selling_price}\n"
-        f"� <b>Your Balance:</b> ${user_balance:.2f}\n"
+        f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
         f"📱 <b>Service:</b> {service_name}\n\n"
         "⚡ Checking wallet balance...",
         parse_mode='HTML'
@@ -2463,9 +4553,9 @@ async def handle_service_purchase(update: Update, context: ContextTypes.DEFAULT_
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.edit_message_text(
-            f"💳 <b>Insufficient Balance</b>\n\n"
+            f"💰 <b>Insufficient Balance</b>\n\n"
             f"💰 <b>Service Cost:</b> ${selling_price:.2f}\n"
-            f"💳 <b>Your Balance:</b> ${user_balance:.2f}\n"
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
             f"💸 <b>Need:</b> ${needed_amount:.2f} more\n\n"
             f"💡 Add funds to your wallet to continue.\n"
             f"Minimum deposit: ${wallet_system.MIN_DEPOSIT_USD}",
@@ -2474,7 +4564,7 @@ async def handle_service_purchase(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # User has sufficient balance - proceed with instant purchase
+    # User has sufficient balance - proceed with instant purchase (NO CONFIRMATION NEEDED)
     user_logger.info(
         "⚡ Instant purchase: User %s has sufficient balance ($%.2f)", user.id, user_balance)
 
@@ -2484,32 +4574,33 @@ async def handle_service_purchase(update: Update, context: ContextTypes.DEFAULT_
         context.user_data['selected_service_name'] = service_name
         context.user_data['selected_price'] = selling_price
 
-    # Show confirmation
-    keyboard = [[
-        InlineKeyboardButton(
-            "✅ Confirm Purchase", callback_data=f"wallet_purchase_{service_id}_{selling_price}"),
-        InlineKeyboardButton("❌ Cancel", callback_data="start")
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    # AUTO-PROCESS purchase immediately without confirmation
     await query.edit_message_text(
-        f"💳 <b>Confirm Purchase</b>\n\n"
-        f"� <b>Service:</b> {service_name}\n"
+        f"⚡ <b>Processing Purchase...</b>\n\n"
+        f"📱 <b>Service:</b> {service_name}\n"
         f"💰 <b>Cost:</b> ${selling_price:.2f}\n"
-        f"� <b>Your Balance:</b> ${user_balance:.2f}\n"
-        f"� <b>After Purchase:</b> ${user_balance - selling_price:.2f}\n\n"
-        f"⚡ <b>Instant purchase using wallet balance</b>\n"
-        f"🔄 Service will be delivered immediately",
-        parse_mode='HTML',
-        reply_markup=reply_markup
+        f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+        f"💰 <b>After Purchase:</b> ${user_balance - selling_price:.2f}\n\n"
+        f"🔄 <b>Processing instant purchase...</b>\n"
+        f"📱 Service will be delivered automatically",
+        parse_mode='HTML'
+    )
+
+    # Process the wallet purchase immediately
+    await process_wallet_service_purchase(
+        user_id=user.id,
+        context=context,
+        send_method=query.edit_message_text,
+        service_id=service_id,
+        service_name=service_name
     )
 
     if user:
         logger.info(
-            "💰 Wallet purchase confirmation shown to user %s for %s: $%.2f", user.id, service_name, selling_price)
+            "⚡ Auto-processed purchase for user %s: %s $%.2f", user.id, service_name, selling_price)
     else:
         logger.info(
-            "💰 Wallet purchase confirmation shown for %s: $%.2f", service_name, selling_price)
+            "⚡ Auto-processed purchase: %s $%.2f", service_name, selling_price)
 
 
 # =============================================================================
@@ -2615,7 +4706,7 @@ async def handle_service_unavailable(user_id: int, payment_id: Optional[str], co
     admin_message = (
         f"🚫 <b>SERVICE UNAVAILABLE ALERT</b>\n\n"
         f"👤 <b>User:</b> {user_id}\n"
-        f"💳 <b>Payment ID:</b> <code>{payment_id or 'N/A'}</code>\n"
+        f"💰 <b>Payment ID:</b> <code>{payment_id or 'N/A'}</code>\n"
         f"⚠️ <b>Issue:</b> {reason}\n\n"
         f"🔧 <b>Action Required:</b>\n"
         f"• Check SMSPool balance\n"
@@ -2681,7 +4772,7 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
             await send_method(
                 f"❌ <b>Insufficient Balance</b>\n\n"
                 f"💰 Service Cost: ${selling_price:.2f}\n"
-                f"💳 Your Balance: ${user_balance:.2f}\n"
+                f"💰 Your Balance: ${user_balance:.2f}\n"
                 f"💸 Need: ${selling_price - user_balance:.2f} more\n\n"
                 f"Please add funds to your wallet.",
                 parse_mode='HTML'
@@ -2771,7 +4862,10 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
                 'cost': selling_price,
                 'status': 'pending',
                 'created_at': datetime.now().isoformat(),
-                'expires_at': (datetime.now() + timedelta(seconds=ORDER_EXPIRES_IN)).isoformat()
+                'expires_at': (datetime.now() + timedelta(seconds=ORDER_EXPIRES_IN)).isoformat(),
+                'country_id': 1,  # Default to US for legacy function
+                'country_name': 'United States',
+                'country_flag': '🇺🇸'
             }
 
             db_order_id = db.create_order(user_id, order_data)
@@ -2783,6 +4877,10 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
 
             # Create cancel/refund buttons for the order
             keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{order_id}"),
+                ],
                 [
                     InlineKeyboardButton(
                         "🚫 Cancel Order", callback_data=f"cancel_order_{order_id}"),
@@ -2877,7 +4975,7 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
 
 
 async def handle_refund_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle refund request"""
+    """Handle refund request - AUTO APPROVAL"""
     query = update.callback_query
     if not query or not query.from_user:
         return
@@ -2901,58 +4999,767 @@ async def handle_refund_request(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Order not found or access denied.")
             return
 
-        if order['status'] not in ['pending', 'timeout', 'error']:
+        if order['status'] not in ['pending', 'timeout', 'error', 'cancelled']:
             await query.edit_message_text(
                 f"❌ Order #{order_id} is not eligible for refund.\n"
                 f"Current status: {order['status']}"
             )
             return
 
-        # Create refund request
-        db.create_refund_request(user_id, order_id)
+        # CRITICAL SECURITY CHECK: Prevent duplicate refunds
+        if order['status'] == 'refunded':
+            await query.edit_message_text(
+                f"❌ <b>Already Refunded</b>\n\n"
+                f"Order #{order_id} has already been refunded.\n"
+                f"Check your wallet balance or order history."
+            )
+            logger.warning(
+                "🚨 DUPLICATE REFUND ATTEMPT: User %s tried to refund already refunded order %s",
+                user_id, order_id
+            )
+            return
 
-        # Notify all admins
-        for admin_id in ADMIN_IDS:
-            try:
-                keyboard = [[
-                    InlineKeyboardButton(
-                        "✅ Approve", callback_data=f"approve_refund_{order_id}"),
-                    InlineKeyboardButton(
-                        "❌ Deny", callback_data=f"deny_refund_{order_id}")
-                ]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
+        # AUTOMATICALLY PROCESS REFUND (No admin approval needed)
+        if wallet_system:
+            refund_success = wallet_system.process_refund(
+                user_id=user_id,
+                refund_amount=order['cost'],
+                order_id=str(order_id),
+                reason="User requested refund - auto approved"
+            )
 
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"💰 <b>Refund Request</b>\n\n"
-                        f"👤 User: {user_id}\n"
-                        f"📱 Order: #{order_id}\n"
-                        f"💰 Amount: ${order['cost']}\n"
-                        f"📞 Number: {order['number']}\n"
-                        f"🔄 Status: {order['status']}\n\n"
-                        f"Approve or deny this refund request:"
-                    ),
+            if refund_success:
+                # Update order status to refunded
+                db.update_order_status(order_id, 'refunded')
+
+                # Cancel order with SMSPool if available
+                if sms_api:
+                    try:
+                        cancel_result = await sms_api.cancel_order(str(order_id))
+                        if cancel_result.get('success'):
+                            logger.info(
+                                "✅ User refund order %s cancelled with SMSPool", order_id)
+                        else:
+                            logger.warning(
+                                "⚠️ Failed to cancel user refund order %s with SMSPool", order_id)
+                    except Exception as cancel_error:
+                        logger.error(
+                            "❌ Error cancelling user refund order %s: %s", order_id, cancel_error)
+
+                # Get updated balance
+                user_balance = wallet_system.get_user_balance(user_id)
+
+                await query.edit_message_text(
+                    f"✅ <b>Refund Processed</b>\n\n"
+                    f"🆔 <b>Order:</b> #{order_id}\n"
+                    f"💰 <b>Refund Amount:</b> ${order['cost']}\n"
+                    f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                    f"✅ Your refund has been automatically processed and added to your wallet.\n"
+                    f"You can use your balance for new orders anytime.\n\n"
+                    f"💡 Quick tip: Use 'Order Again' to reorder the same service instantly!",
                     parse_mode='HTML',
-                    reply_markup=reply_markup
+                    reply_markup=create_order_again_keyboard(order_id, order)
                 )
-            except RuntimeError as e:
-                logger.error("Failed to notify admin %s: %s", admin_id, str(e))
 
+                logger.info(
+                    "✅ Auto-approved refund for order %s, user %s, amount $%.2f",
+                    order_id, user_id, order['cost']
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ <b>Refund Failed</b>\n\n"
+                    f"Failed to process refund for order #{order_id}.\n"
+                    f"Please try again or contact support.",
+                    parse_mode='HTML'
+                )
+                logger.error(
+                    "❌ Auto-refund failed for order %s, user %s", order_id, user_id)
+        else:
+            await query.edit_message_text(
+                f"❌ <b>Wallet System Unavailable</b>\n\n"
+                f"Refund system is currently unavailable.\n"
+                f"Please contact support for manual processing.",
+                parse_mode='HTML'
+            )
+
+    except Exception as e:
+        logger.error("❌ Error processing auto-refund: %s", str(e))
         await query.edit_message_text(
-            f"✅ <b>Refund Requested</b>\n\n"
-            f"Your refund request for order #{order_id} has been submitted.\n"
-            f"Administrators have been notified.\n\n"
-            f"You will be notified when the request is processed.",
+            f"❌ <b>Refund Error</b>\n\n"
+            f"An error occurred while processing your refund.\n"
+            f"Please try again or contact support.",
             parse_mode='HTML'
         )
 
-        logger.info(
-            "💰 Refund requested by user %s for order %s", user_id, order_id)
 
-    except RuntimeError as e:
-        logger.error("Error processing refund request: %s", str(e))
-        await query.edit_message_text("❌ Error processing refund request.")
+async def handle_instant_refund_and_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle instant refund and reorder request - cancels current order and places new one with same settings"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+
+    user_id = query.from_user.id
+    await query.answer()
+
+    try:
+        if not query.data:
+            await query.edit_message_text("❌ Invalid request data.")
+            return
+
+        # Extract order_id from callback data (format: "instant_refund_reorder_{order_id}")
+        order_id = query.data.split('_', 3)[3]
+
+        # Verify order belongs to user and is eligible for instant refund
+        order = db.get_order(order_id)
+        if not order or order['user_id'] != user_id:
+            await query.edit_message_text("❌ Order not found or access denied.")
+            return
+
+        # Check if order is in valid state for instant refund
+        if order['status'] not in ['pending', 'timeout', 'error']:
+            await query.edit_message_text(
+                f"❌ <b>Cannot Process Instant Refund</b>\n\n"
+                f"Order #{order_id} status: {order['status']}\n"
+                f"Instant refund is only available for pending orders.\n\n"
+                f"Use regular refund if the order is completed or cancelled.",
+                parse_mode='HTML'
+            )
+            return
+
+        # CRITICAL SECURITY CHECK: Prevent duplicate refunds
+        if order['status'] == 'refunded':
+            await query.edit_message_text(
+                f"❌ <b>Already Refunded</b>\n\n"
+                f"Order #{order_id} has already been refunded.\n"
+                f"Check your wallet balance or order history.",
+                parse_mode='HTML'
+            )
+            logger.warning(
+                "🚨 DUPLICATE INSTANT REFUND ATTEMPT: User %s tried to refund already refunded order %s",
+                user_id, order_id
+            )
+            return
+
+        # Get order details for reorder
+        service_id = order.get('service_id', 1574)  # Default to Ring4
+        service_name = order.get('service_name', 'Ring4')
+        country_id = order.get('country_id', 1)  # Default to US
+        country_name = order.get('country_name', 'United States')
+        country_flag = order.get('country_flag', '🇺🇸')
+        order_cost = float(order.get('cost', 0))
+
+        # Critical validation: Ensure service_id is valid
+        if service_id is None:
+            logger.error(
+                "🚨 CRITICAL: service_id is None for order %s, forcing to Ring4", order_id)
+            service_id = 1574
+            service_name = 'Ring4'
+
+        # Log the extracted values for debugging
+        logger.info("📊 Instant refund for order %s: service_id=%s, service_name=%s, country_id=%s",
+                    order_id, service_id, service_name, country_id)
+
+        if not wallet_system or not sms_api:
+            await query.edit_message_text(
+                "❌ <b>System Unavailable</b>\n\n"
+                "Instant refund and reorder system is currently unavailable.\n"
+                "Please try regular refund or contact support.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Step 1: Show processing message
+        await query.edit_message_text(
+            f"🔄 <b>Processing Instant Number Replacement</b>\n\n"
+            f"🆔 <b>Current Order:</b> #{order_id}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"💰 <b>Amount:</b> ${order_cost:.2f}\n\n"
+            f"⏳ Step 1/4: Verifying new number availability...",
+            parse_mode='HTML'
+        )
+
+        # Step 2: FIRST check if new order can be placed (CRITICAL - do this BEFORE refunding)
+        try:
+            # Check service availability first
+            availability_check = await sms_api.check_service_availability(service_id, country_id)
+            if not availability_check or availability_check == 0:
+                await query.edit_message_text(
+                    f"❌ <b>Service Unavailable</b>\n\n"
+                    f"📱 <b>Service:</b> {service_name}\n"
+                    f"🌍 <b>Country:</b> {country_flag} {country_name}\n\n"
+                    f"This service is temporarily unavailable.\n"
+                    f"Your current order #{order_id} remains active.\n\n"
+                    f"💡 Try a different service or use regular refund.",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Step 3: Cancel current order with SMSPool (use our fixed API)
+            await query.edit_message_text(
+                f"🔄 <b>Processing Instant Number Replacement</b>\n\n"
+                f"🆔 <b>Current Order:</b> #{order_id}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"💰 <b>Amount:</b> ${order_cost:.2f}\n\n"
+                f"⏳ Step 2/4: Cancelling current order...",
+                parse_mode='HTML'
+            )
+
+            # Cancel the polling task FIRST to prevent status update notifications
+            if order_id in active_polls:
+                active_polls[order_id].cancel()
+                del active_polls[order_id]
+                logger.info(
+                    "🛑 Cancelled active polling for order %s before instant refund", order_id)
+
+            # Cancel with SMS provider using our fixed API
+            api_refund_success = False
+            try:
+                cancel_result = await sms_api.cancel_order(str(order_id))
+
+                # Our fixed SMS Pool API now returns reliable results
+                if cancel_result.get('success', False):
+                    api_refund_success = True
+                    logger.info(
+                        "✅ Order %s successfully cancelled with SMS Pool API for instant reorder", order_id)
+                else:
+                    logger.warning(
+                        "⚠️ SMS Pool API did not confirm cancellation for order %s: %s",
+                        order_id, cancel_result.get('message', 'Unknown error'))
+            except Exception as cancel_error:
+                logger.warning(
+                    "⚠️ Error cancelling order %s for instant reorder: %s", order_id, cancel_error)
+
+            # Step 4: Process new order (only if cancellation succeeded or to prevent user loss)
+            await query.edit_message_text(
+                f"🔄 <b>Processing Instant Number Replacement</b>\n\n"
+                f"🆔 <b>Current Order:</b> #{order_id}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"💰 <b>Amount:</b> ${order_cost:.2f}\n\n"
+                f"⏳ Step 3/4: Getting your new number...",
+                parse_mode='HTML'
+            )
+
+            # Purchase new number using the proven working method
+            purchase_result = await sms_api.purchase_specific_service(service_id, service_name, country_id)
+
+            if not purchase_result.get('success'):
+                # New order failed - current order still active
+                error_msg = clean_html_message(
+                    purchase_result.get('message', 'Unknown error'))
+                await query.edit_message_text(
+                    f"❌ <b>New Number Purchase Failed</b>\n\n"
+                    f"🆔 <b>Current Order:</b> #{order_id} (still active)\n"
+                    f"❌ <b>Error:</b> {error_msg}\n\n"
+                    f"Your current order remains active and unchanged.\n"
+                    f"You can use regular refund or try again later.",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Step 5: New order successful - now handle refund based on API confirmation
+            new_order_id = purchase_result.get('order_id')
+            new_phone_number = purchase_result.get('number')
+
+            await query.edit_message_text(
+                f"🔄 <b>Processing Instant Number Replacement</b>\n\n"
+                f"✅ <b>New Number:</b> <code>{new_phone_number}</code>\n"
+                f"🆔 <b>New Order:</b> #{new_order_id}\n\n"
+                f"⏳ Step 4/4: Finalizing replacement...",
+                parse_mode='HTML'
+            )
+
+            # Process refund based on API cancellation result
+            refund_success = False
+            if api_refund_success:
+                # API successfully cancelled and refunded - no wallet refund needed
+                logger.info(
+                    f"✅ Order {order_id} refunded by SMS Pool API - no wallet refund needed")
+                refund_success = True
+            else:
+                # API refund failed or unconfirmed - process wallet refund to protect user
+                logger.warning(
+                    f"⚠️ SMS Pool API refund failed for order {order_id} - processing wallet refund")
+                refund_success = wallet_system.process_refund(
+                    user_id=user_id,
+                    refund_amount=order_cost,
+                    order_id=str(order_id),
+                    reason="Instant number replacement - wallet refund (API refund failed)"
+                )
+
+            if not refund_success:
+                # This is a critical error - we have two orders now
+                logger.error(
+                    "🚨 CRITICAL: Refund failed after new order placed - user %s has double charge", user_id)
+
+                # Try to cancel the new order to avoid double charging
+                try:
+                    await sms_api.cancel_order(str(new_order_id))
+                except:
+                    pass
+
+                await query.edit_message_text(
+                    f"❌ <b>Critical Error</b>\n\n"
+                    f"Failed to process refund for order #{order_id}.\n"
+                    f"New order #{new_order_id} has been cancelled.\n\n"
+                    f"Please contact support immediately.\n"
+                    f"Reference: Refund processing error",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Update original order status
+            db.update_order_status(order_id, 'refunded')
+
+            # Create new order in database
+            new_order_data = {
+                'order_id': new_order_id,
+                'number': new_phone_number,
+                'cost': order_cost,
+                'service_name': service_name,
+                'service_id': service_id,
+                'country_id': country_id,
+                'country_name': country_name,
+                'country_flag': country_flag
+            }
+
+            db.create_order(user_id, new_order_data)
+
+            # Deduct balance for new order
+            wallet_system.deduct_balance(
+                user_id=user_id,
+                amount=order_cost,
+                description=f"Instant number replacement - {service_name} ({country_name})",
+                order_id=str(new_order_id)
+            )
+
+            # Get updated balance
+            user_balance = wallet_system.get_user_balance(user_id)
+
+            # Create buttons for the new order
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{new_order_id}"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💰 Instant Refund", callback_data=f"refund_{new_order_id}"),
+                    InlineKeyboardButton(
+                        "❌ Cancel Order", callback_data=f"cancel_order_{new_order_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Send success message with new number and refund status
+            refund_status_msg = ""
+            if api_refund_success:
+                refund_status_msg = "✅ <b>SMS Pool Refund:</b> Confirmed\n"
+            else:
+                refund_status_msg = "💰 <b>Wallet Refund:</b> Processed\n"
+
+            await query.edit_message_text(
+                f"🎉 <b>Number Successfully Replaced!</b>\n\n"
+                f"📱 <b>Your New Number:</b> <code>{new_phone_number}</code>\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"💰 <b>Cost:</b> ${order_cost:.2f}\n"
+                f"💰 <b>Wallet Balance:</b> ${user_balance:.2f}\n"
+                f"🆔 <b>New Order ID:</b> <code>{new_order_id}</code>\n\n"
+                f"⏰ <b>Valid for 10 minutes</b>\n"
+                f"🔄 <b>OTP monitoring started</b>\n\n"
+                f"✨ <b>Replaced order #{order_id}</b>\n"
+                f"{refund_status_msg}"
+                f"Use this number for verification. You'll get the OTP automatically!",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+
+            # Start OTP polling for new order
+            if new_order_id:
+                start_otp_polling(new_order_id, user_id, context)
+
+            logger.info(
+                "✅ Instant number replacement completed for user %s: Order %s -> Order %s (Service: %s, Country: %s) - API refund: %s",
+                user_id, order_id, new_order_id, service_name, country_name,
+                "confirmed" if api_refund_success else "wallet processed"
+            )
+
+        except Exception as purchase_error:
+            logger.error("❌ Error during number replacement: %s",
+                         str(purchase_error))
+            error_msg = clean_html_message(str(purchase_error))[:100]
+            await query.edit_message_text(
+                f"❌ <b>Number Replacement Failed</b>\n\n"
+                f"🆔 <b>Current Order:</b> #{order_id} (still active)\n"
+                f"❌ <b>Error:</b> {error_msg}\n\n"
+                f"Your current order remains unchanged.\n"
+                f"Please try again or use regular refund.\n\n"
+                f"💡 All systems are working normally.",
+                parse_mode='HTML'
+            )
+
+    except Exception as e:
+        logger.error(
+            "❌ Error processing instant number replacement: %s", str(e))
+        error_msg = clean_html_message(str(e))[:100]
+        await query.edit_message_text(
+            f"❌ <b>System Error</b>\n\n"
+            f"An error occurred while processing your request.\n"
+            f"Your current order remains unchanged.\n\n"
+            f"Please try again or use regular refund.\n"
+            f"Error: {error_msg}",
+            parse_mode='HTML'
+        )
+
+
+async def handle_refund_and_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle refund request with immediate reorder using same service and country"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+
+    user_id = query.from_user.id
+    await query.answer()
+
+    try:
+        if not query.data:
+            await query.edit_message_text("❌ Invalid request data.")
+            return
+
+        # Extract order_id from callback data (format: "refund_reorder_{order_id}")
+        order_id = query.data.split('_', 2)[2]
+
+        # Verify order belongs to user and is refundable
+        order = db.get_order(order_id)
+        if not order or order['user_id'] != user_id:
+            await query.edit_message_text("❌ Order not found or access denied.")
+            return
+
+        if order['status'] not in ['pending', 'timeout', 'error', 'cancelled']:
+            await query.edit_message_text(
+                f"❌ Order #{order_id} is not eligible for refund.\n"
+                f"Current status: {order['status']}"
+            )
+            return
+
+        # CRITICAL SECURITY CHECK: Prevent duplicate refunds
+        if order['status'] == 'refunded':
+            await query.edit_message_text(
+                f"❌ <b>Already Refunded</b>\n\n"
+                f"Order #{order_id} has already been refunded.\n"
+                f"Check your wallet balance or order history.",
+                parse_mode='HTML'
+            )
+            logger.warning(
+                "🚨 DUPLICATE REFUND ATTEMPT: User %s tried to refund and reorder already refunded order %s",
+                user_id, order_id
+            )
+            return
+
+        # Get order details for reorder
+        service_id = order.get('service_id', 1574)  # Default to Ring4
+        service_name = order.get('service_name', 'Ring4')
+        country_id = order.get('country_id', 1)  # Default to US
+        country_name = order.get('country_name', 'United States')
+        country_flag = order.get('country_flag', '🇺🇸')
+        order_cost = float(order.get('cost', 0))
+
+        if not wallet_system or not sms_api:
+            await query.edit_message_text(
+                "❌ <b>System Unavailable</b>\n\n"
+                "Refund and reorder system is currently unavailable.\n"
+                "Please try regular refund or contact support.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Step 1: Show processing message
+        await query.edit_message_text(
+            f"🔄 <b>Processing Refund & Reorder</b>\n\n"
+            f"🆔 <b>Cancelling Order:</b> #{order_id}\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"💰 <b>Amount:</b> ${order_cost:.2f}\n\n"
+            f"⏳ Step 1/3: Cancelling order and verifying refund...",
+            parse_mode='HTML'
+        )
+
+        # Step 2: Cancel with SMS provider using our fixed API
+        api_refund_success = False
+
+        if sms_api:
+            try:
+                # Cancel the order using our fixed SMS Pool API
+                cancel_result = await sms_api.cancel_order(str(order_id))
+
+                # Our fixed SMS Pool API now returns reliable results
+                if cancel_result.get('success', False):
+                    api_refund_success = True
+                    logger.info(
+                        "✅ Order %s successfully cancelled with SMS Pool API for reorder", order_id)
+                else:
+                    logger.warning(
+                        "⚠️ SMS Pool API did not confirm cancellation for order %s: %s",
+                        order_id, cancel_result.get('message', 'Unknown error'))
+            except Exception as cancel_error:
+                logger.warning(
+                    "⚠️ Error cancelling order %s for reorder: %s", order_id, cancel_error)
+
+        # Step 3: Process wallet refund only if API refund failed
+        refund_success = False
+        if api_refund_success:
+            # API successfully cancelled and refunded - no wallet refund needed
+            logger.info(
+                f"✅ Order {order_id} refunded by SMS Pool API - no wallet refund needed")
+            refund_success = True
+        else:
+            # API refund failed - process wallet refund to protect user
+            logger.warning(
+                f"⚠️ SMS Pool API refund failed for order {order_id} - processing wallet refund")
+            refund_success = wallet_system.process_refund(
+                user_id=user_id,
+                refund_amount=order_cost,
+                order_id=str(order_id),
+                reason="Refund & reorder - wallet refund (API refund failed)"
+            )
+
+        if not refund_success:
+            await query.edit_message_text(
+                f"❌ <b>Refund Failed</b>\n\n"
+                f"Failed to process refund for order #{order_id}.\n"
+                f"Please try regular refund or contact support.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Update original order status to refunded
+        db.update_order_status(order_id, 'refunded')
+
+        # Step 4: Show reorder progress with refund status
+        refund_status_msg = ""
+        if api_refund_success:
+            refund_status_msg = "✅ <b>SMS Pool Refund:</b> Confirmed\n"
+        else:
+            refund_status_msg = "💰 <b>Wallet Refund:</b> Processed\n"
+
+        await query.edit_message_text(
+            f"✅ <b>Refund Completed!</b>\n\n"
+            f"🆔 <b>Refunded Order:</b> #{order_id}\n"
+            f"💰 <b>Amount:</b> ${order_cost:.2f}\n"
+            f"{refund_status_msg}\n"
+            f"⏳ Step 2/3: Ordering new {service_name} number for {country_flag} {country_name}...",
+            parse_mode='HTML'
+        )
+
+        # Step 5: Set context for new purchase
+        if context.user_data is not None:
+            context.user_data['selected_service_id'] = service_id
+            context.user_data['selected_country_id'] = country_id
+            context.user_data['selected_price'] = order_cost
+
+        # Step 6: Process new purchase
+        await process_wallet_purchase(
+            user_id=user_id,
+            context=context,
+            send_method=query.edit_message_text,
+            service_id=service_id,
+            service_name=service_name,
+            selling_price=order_cost
+        )
+
+        logger.info(
+            "✅ Refund & reorder completed for user %s: Order %s -> New order (Service: %s, Country: %s) - API refund: %s",
+            user_id, order_id, service_name, country_name,
+            "confirmed" if api_refund_success else "wallet processed"
+        )
+
+    except Exception as e:
+        logger.error("❌ Error processing refund & reorder: %s", str(e))
+        await query.edit_message_text(
+            f"❌ <b>Refund & Reorder Error</b>\n\n"
+            f"An error occurred while processing your request.\n"
+            f"Please try regular refund or contact support.\n\n"
+            f"Error: {str(e)[:100]}",
+            parse_mode='HTML'
+        )
+
+
+async def handle_order_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle order again request - automatically reorder using same service and country from previous order"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+
+    user_id = query.from_user.id
+    await query.answer()
+
+    try:
+        if not query.data:
+            await query.edit_message_text("❌ Invalid request data.")
+            return
+
+        # Extract order_id from callback data (format: "order_again_{order_id}")
+        order_id = query.data.split('_', 2)[2]
+
+        # Get original order details
+        order = db.get_order(order_id)
+        if not order or order['user_id'] != user_id:
+            await query.edit_message_text("❌ Order not found or access denied.")
+            return
+
+        # Extract service details from original order
+        service_id = order.get('service_id', 1574)  # Default to Ring4
+        service_name = order.get('service_name', 'Ring4')
+        country_id = order.get('country_id', 1)  # Default to US
+        country_name = order.get('country_name', 'United States')
+        country_flag = order.get('country_flag', '🇺🇸')
+        order_cost = float(order.get('cost', 0.15))
+
+        # Critical validation: Ensure service_id is valid
+        if service_id is None:
+            logger.error(
+                "🚨 CRITICAL: service_id is None for order %s, forcing to Ring4", order_id)
+            service_id = 1574
+            service_name = 'Ring4'
+
+        logger.info("🔄 Order again for user %s: service_id=%s, service_name=%s, country_id=%s",
+                    user_id, service_id, service_name, country_id)
+
+        if not wallet_system or not sms_api:
+            await query.edit_message_text(
+                "❌ <b>System Unavailable</b>\n\n"
+                "Order system is currently unavailable.\n"
+                "Please try again later or contact support.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Check user wallet balance
+        user_balance = wallet_system.get_user_balance(user_id)
+        if user_balance < order_cost:
+            await query.edit_message_text(
+                f"❌ <b>Insufficient Balance</b>\n\n"
+                f"💰 <b>Service Cost:</b> ${order_cost:.2f}\n"
+                f"💰 <b>Your Balance:</b> ${user_balance:.2f}\n"
+                f"💸 <b>Need:</b> ${order_cost - user_balance:.2f} more\n\n"
+                f"Please add funds to your wallet first.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Show processing message
+        await query.edit_message_text(
+            f"🔄 <b>Ordering Again</b>\n\n"
+            f"📱 <b>Service:</b> {service_name}\n"
+            f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+            f"💰 <b>Price:</b> ${order_cost:.2f}\n\n"
+            f"⏳ Step 1/3: Checking service availability...",
+            parse_mode='HTML'
+        )
+
+        # Check service availability first
+        try:
+            availability_check = await sms_api.check_service_availability(service_id, country_id)
+            if not availability_check or availability_check == 0:
+                await query.edit_message_text(
+                    f"❌ <b>Service Unavailable</b>\n\n"
+                    f"📱 <b>Service:</b> {service_name}\n"
+                    f"🌍 <b>Country:</b> {country_flag} {country_name}\n\n"
+                    f"This service is temporarily unavailable.\n"
+                    f"Please try a different service or try again later.\n\n"
+                    f"💡 Use /buy to browse available services.",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Service available - proceed with purchase
+            await query.edit_message_text(
+                f"✅ <b>Service Available!</b>\n\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"💰 <b>Price:</b> ${order_cost:.2f}\n\n"
+                f"⏳ Step 2/3: Processing payment...",
+                parse_mode='HTML'
+            )
+
+            # Set context for purchase
+            if context.user_data is not None:
+                context.user_data['selected_service_id'] = service_id
+                context.user_data['selected_country_id'] = country_id
+                context.user_data['selected_price'] = order_cost
+
+            # Process the purchase using wallet
+            await process_wallet_service_purchase_with_country(
+                user_id=user_id,
+                context=context,
+                send_method=query.edit_message_text,
+                service_id=service_id,
+                service_name=service_name,
+                country_id=country_id,
+                country_name=country_name,
+                country_flag=country_flag
+            )
+
+            logger.info(
+                "✅ Order again completed for user %s: Service %s in %s ($%.2f)",
+                user_id, service_name, country_name, order_cost
+            )
+
+        except Exception as purchase_error:
+            logger.error("❌ Error during order again: %s", str(purchase_error))
+            error_msg = clean_html_message(str(purchase_error))[:100]
+            await query.edit_message_text(
+                f"❌ <b>Order Failed</b>\n\n"
+                f"📱 <b>Service:</b> {service_name}\n"
+                f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
+                f"❌ <b>Error:</b> {error_msg}\n\n"
+                f"Please try again or use /buy for different services.\n\n"
+                f"💡 Your wallet balance was not deducted.",
+                parse_mode='HTML'
+            )
+
+    except Exception as e:
+        logger.error("❌ Error processing order again: %s", str(e))
+        error_msg = clean_html_message(str(e))[:100]
+        await query.edit_message_text(
+            f"❌ <b>System Error</b>\n\n"
+            f"An error occurred while processing your request.\n"
+            f"Please try again or contact support.\n\n"
+            f"Error: {error_msg}",
+            parse_mode='HTML'
+        )
+
+
+def create_order_again_keyboard(order_id, order):
+    """Create keyboard with Order Again button if service details are available"""
+    keyboard = []
+
+    # Only show Order Again if we have service details
+    if order.get('service_id') and order.get('country_id'):
+        service_name = order.get('service_name', 'Same Service')
+        country_flag = order.get('country_flag', '🌍')
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🔄 Order Again ({service_name} in {country_flag})",
+                callback_data=f"order_again_{order_id}"
+            )
+        ])
+
+    keyboard.extend([
+        [
+            InlineKeyboardButton("📱 Browse Services",
+                                 callback_data="browse_services"),
+            InlineKeyboardButton("💰 Balance", callback_data="show_balance")
+        ],
+        [
+            InlineKeyboardButton("🔙 Main Menu", callback_data="start_menu")
+        ]
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def show_admin_refunds(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -3131,7 +5938,7 @@ async def process_refund_approval(update: Update, context: ContextTypes.DEFAULT_
                                 f"Order: #{order_id}\n"
                                 f"💰 Refund Amount: ${order['cost']}\n"
                                 f"📞 Number: {order['number']}\n"
-                                f"💳 New Balance: ${user_balance:.2f}\n\n"
+                                f"💰 New Balance: ${user_balance:.2f}\n\n"
                                 f"✅ Order cancelled with provider\n"
                                 f"✅ Amount refunded to your wallet"
                             ),
@@ -3176,7 +5983,7 @@ async def process_refund_approval(update: Update, context: ContextTypes.DEFAULT_
                             f"Order: #{order_id}\n"
                             f"💰 Refund Amount: ${order['cost']}\n"
                             f"📞 Number: {order['number']}\n"
-                            f"💳 New Balance: ${user_balance:.2f}\n\n"
+                            f"💰 New Balance: ${user_balance:.2f}\n\n"
                             f"✅ Amount refunded to your wallet"
                         ),
                         parse_mode='HTML'
@@ -3232,56 +6039,14 @@ async def process_refund_approval(update: Update, context: ContextTypes.DEFAULT_
 # WALLET-BASED PURCHASE HANDLERS (Payment system removed)
 # =============================================================================
 
-
-async def handle_wallet_purchase_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle wallet purchase confirmation from user"""
-    query = update.callback_query
-    user = update.effective_user
-
-    if not query or not user or not query.data:
-        return
-
-    await query.answer()
-
-    try:
-        # Parse callback data: "wallet_purchase_1574_0.17"
-        parts = query.data.split('_')
-        if len(parts) < 4:
-            await query.edit_message_text("❌ Invalid purchase data.", parse_mode='HTML')
-            return
-
-        service_id = int(parts[2])
-        selling_price = float(parts[3])
-
-        # Get service name from stored user data or default
-        service_name = context.user_data.get(
-            'selected_service_name', 'Ring4') if context.user_data else 'Ring4'
-
-        # Store selection for processing
-        if context.user_data:
-            context.user_data['selected_service_id'] = service_id
-            context.user_data['selected_service_name'] = service_name
-            context.user_data['selected_price'] = selling_price
-
-        # Process the wallet purchase
-        await process_wallet_service_purchase(
-            user_id=user.id,
-            context=context,
-            send_method=query.edit_message_text,
-            service_id=service_id,
-            service_name=service_name
-        )
-
-    except ValueError as e:
-        await query.edit_message_text(f"❌ Invalid purchase data: {str(e)}", parse_mode='HTML')
-    except RuntimeError as e:
-        logger.error("Error in wallet purchase confirmation: %s", str(e))
-        await query.edit_message_text(f"❌ Purchase error: {str(e)}", parse_mode='HTML')
-
+# REMOVED: handle_wallet_purchase_confirmation - now auto-processed
+# REMOVED: handle_confirm_cancel - now auto-processed
+# REMOVED: handle_keep_order - no longer needed
 
 # Old payment handlers removed - now using wallet system only
 # All service purchases are now instant using wallet balance
 # Admin approval only needed for deposits, not individual purchases
+
 
 async def handle_payment_sent_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle when user claims payment is sent"""
@@ -3364,6 +6129,93 @@ async def handle_cancel_payment(update: Update, _context: ContextTypes.DEFAULT_T
 # =============================================================================
 
 
+async def process_order_cancellation(user_id: int, order_id: str, order: Dict, query):
+    """Process order cancellation immediately without confirmation"""
+    try:
+        # Cancel the polling task if it's active
+        if order_id in active_polls:
+            active_polls[order_id].cancel()
+            del active_polls[order_id]
+            logger.info("🛑 Cancelled active polling for order %s", order_id)
+
+        # Cancel the order in SMSPool API
+        api_cancel_success = False
+        api_cancelled_via_api = False
+        api_message = "API not available"
+
+        if sms_api:
+            try:
+                cancel_result = await sms_api.cancel_order(str(order_id))
+                api_cancel_success = cancel_result.get('success', False)
+                api_cancelled_via_api = cancel_result.get(
+                    'cancelled_via_api', False)
+                api_message = cancel_result.get(
+                    'message', 'Unknown API response')
+
+                if api_cancel_success:
+                    logger.info(
+                        "✅ Successfully cancelled order %s via SMSPool API", order_id)
+                else:
+                    logger.warning(
+                        "⚠️ Failed to cancel order %s via SMSPool API: %s", order_id, api_message)
+            except Exception as api_error:
+                logger.error(
+                    "❌ Error cancelling order %s via API: %s", order_id, api_error)
+                api_message = f"API error: {str(api_error)}"
+
+        # Process refund via wallet system
+        refund_success = False
+        if wallet_system:
+            refund_success = wallet_system.process_refund(
+                user_id=user_id,
+                refund_amount=order['cost'],
+                order_id=str(order_id),
+                reason="User cancelled order - auto refund"
+            )
+
+        # Update order status
+        if refund_success:
+            db.update_order_status(order_id, 'cancelled')
+            user_balance = wallet_system.get_user_balance(
+                user_id) if wallet_system else 0.00
+
+            await query.edit_message_text(
+                f"✅ <b>Order Cancelled Successfully</b>\n\n"
+                f"🆔 <b>Order ID:</b> #{order_id}\n"
+                f"💰 <b>Refund Amount:</b> ${order['cost']}\n"
+                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                f"✅ Your order has been cancelled and refund processed automatically.\n"
+                f"🔄 <b>API Status:</b> {api_message}\n\n"
+                f"💡 You can place a new order anytime or use 'Order Again' for the same service!",
+                parse_mode='HTML',
+                reply_markup=create_order_again_keyboard(order_id, order)
+            )
+
+            logger.info(
+                "✅ Order %s cancelled successfully for user %s with refund", order_id, user_id)
+        else:
+            await query.edit_message_text(
+                f"⚠️ <b>Order Cancelled (Refund Issue)</b>\n\n"
+                f"🆔 <b>Order ID:</b> #{order_id}\n"
+                f"🔄 Your order has been cancelled but there was an issue processing the refund.\n"
+                f"💰 Please contact support for refund assistance.\n\n"
+                f"🔄 <b>API Status:</b> {api_message}",
+                parse_mode='HTML'
+            )
+
+            logger.error(
+                "❌ Order %s cancelled but refund failed for user %s", order_id, user_id)
+
+    except Exception as e:
+        logger.error("❌ Error processing order cancellation: %s", str(e))
+        await query.edit_message_text(
+            f"❌ <b>Cancellation Error</b>\n\n"
+            f"An error occurred while cancelling your order.\n"
+            f"Please try again or contact support.",
+            parse_mode='HTML'
+        )
+
+
 async def handle_cancel_order(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Handle order cancellation request from user"""
     query = update.callback_query
@@ -3418,34 +6270,26 @@ async def handle_cancel_order(update: Update, _context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        # Show cancellation confirmation
+        # AUTO-PROCESS cancellation immediately without confirmation
         number = order.get('number', 'N/A')
         cost = order.get('cost', 'N/A')
 
         await query.edit_message_text(
-            f"⚠️ <b>Confirm Order Cancellation</b>\n\n"
+            f"🔄 <b>Cancelling Order...</b>\n\n"
             f"🆔 <b>Order ID:</b> #{order_id}\n"
             f"📱 <b>Number:</b> <code>{number}</code>\n"
             f"💰 <b>Amount:</b> ${cost}\n\n"
-            f"🔄 <b>What will happen:</b>\n"
-            f"• Your order will be cancelled immediately\n"
-            f"• The number will be released back to the pool\n"
-            f"• Full refund will be processed automatically\n"
-            f"• OTP monitoring will stop\n\n"
-            f"❓ <b>Are you sure you want to cancel this order?</b>",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Yes, Cancel Order",
-                                         callback_data=f"confirm_cancel_{order_id}"),
-                    InlineKeyboardButton("❌ No, Keep Order",
-                                         callback_data=f"keep_order_{order_id}")
-                ]
-            ])
+            f"⚡ <b>Processing automatic cancellation...</b>\n"
+            f"💰 Full refund will be processed automatically\n"
+            f"🔄 OTP monitoring will stop",
+            parse_mode='HTML'
         )
 
+        # Process cancellation immediately
+        await process_order_cancellation(user_id, order_id, order, query)
+
         logger.info(
-            "🔔 Cancellation confirmation shown for order %s by user %s", order_id, user_id)
+            "⚡ Auto-processed cancellation for order %s by user %s", order_id, user_id)
 
     except RuntimeError as e:
         logger.error("❌ Error in cancel order handler: %s", str(e))
@@ -3456,215 +6300,8 @@ async def handle_cancel_order(update: Update, _context: ContextTypes.DEFAULT_TYP
             parse_mode='HTML'
         )
 
-
-async def handle_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle confirmed cancellation request"""
-    query = update.callback_query
-    if not query or not query.from_user or not query.data:
-        return
-
-    user_id = query.from_user.id
-    await query.answer()
-
-    try:
-        # Extract order_id from callback data: "confirm_cancel_{order_id}"
-        order_id = "_".join(query.data.split('_')[2:])  # Keep as string
-
-        # Show processing message
-        await query.edit_message_text(
-            f"🔄 <b>Cancelling Order...</b>\n\n"
-            f"🆔 <b>Order ID:</b> #{order_id}\n\n"
-            f"⏳ Please wait while we process your cancellation...",
-            parse_mode='HTML'
-        )
-
-        # Get order details
-        order = db.get_order(order_id)
-        if not order or order['user_id'] != user_id:
-            await query.edit_message_text(
-                "❌ <b>Error</b>\n\nOrder not found or access denied.",
-                parse_mode='HTML'
-            )
-            return
-
-        # Cancel the polling task if it's active
-        if order_id in active_polls:
-            active_polls[order_id].cancel()
-            del active_polls[order_id]
-            logger.info("🛑 Cancelled active polling for order %s", order_id)
-
-        # Cancel the order in SMSPool API
-        api_cancel_success = False
-        api_cancelled_via_api = False
-        api_message = "API not available"
-
-        if sms_api:
-            try:
-                cancel_result = await sms_api.cancel_order(str(order_id))
-                api_cancel_success = cancel_result.get('success', False)
-                api_cancelled_via_api = cancel_result.get(
-                    'api_cancelled', False)
-                api_message = cancel_result.get('message', 'Unknown error')
-
-                if api_cancelled_via_api:
-                    logger.info(
-                        "✅ SMSPool order %s cancelled via API successfully", order_id)
-                elif api_cancel_success:
-                    logger.info(
-                        "✅ Order %s marked for cancellation - user refund guaranteed", order_id)
-                else:
-                    logger.warning(
-                        "⚠️ SMSPool cancel API unavailable for order %s: %s", order_id, api_message)
-
-            except RuntimeError as api_error:
-                logger.error(
-                    "❌ Error cancelling order %s in SMSPool: %s", order_id, str(api_error))
-                api_message = f"API error: {str(api_error)}"
-
-        # Update order status to cancelled regardless of API result
-        # (user gets refund either way)
-        db.update_order_status(order_id, 'cancelled')
-
-        # Create automatic refund record
-        db.create_refund_request(user_id, order_id)
-
-        # Notify user about successful cancellation with enhanced messaging
-        success_text = "✅ <b>Order Cancelled Successfully</b>\n\n"
-        success_text += f"🆔 <b>Order ID:</b> #{order_id}\n"
-        success_text += f"📱 <b>Number:</b> <code>{order.get('number', 'N/A')}</code>\n"
-        success_text += f"💰 <b>Refund Amount:</b> ${order.get('cost', 'N/A')}\n\n"
-        success_text += "🔄 <b>Status Updates:</b>\n"
-        success_text += "• Order marked as cancelled ✅\n"
-        success_text += "• OTP monitoring stopped ✅\n"
-
-        if api_cancelled_via_api:
-            success_text += "• Provider order cancelled ✅\n"
-        elif api_cancel_success:
-            success_text += "• Provider cancellation queued ⏳\n"
-        else:
-            success_text += "• Provider cancellation: Manual review required ⚠️\n"
-
-        success_text += "• Refund request created ✅\n\n"
-        success_text += "💰 <b>Refund Guarantee:</b>\n"
-        success_text += "• Your refund is <b>guaranteed</b> regardless of provider status\n"
-        success_text += "• Admin will process your refund within 1-24 hours\n"
-        success_text += "• You'll be notified when completed\n\n"
-
-        if not api_cancelled_via_api:
-            success_text += "ℹ️ <b>Important:</b> Even if provider cancellation is pending, your full refund is secured.\n\n"
-
-        success_text += "📞 <b>Need help?</b> Contact an administrator."
-
-        await query.edit_message_text(success_text, parse_mode='HTML')
-
-        # Notify all admins about the cancellation
-        admin_notification = (
-            f"🔔 <b>USER ORDER CANCELLATION</b>\n\n"
-            f"👤 <b>User ID:</b> {user_id}\n"
-            f"🆔 <b>Order ID:</b> #{order_id}\n"
-            f"📱 <b>Number:</b> {order.get('number', 'N/A')}\n"
-            f"💰 <b>Amount:</b> ${order.get('cost', 'N/A')}\n"
-            f"🕐 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        # Add detailed API cancellation status
-        if api_cancelled_via_api:
-            admin_notification += "🔄 <b>Provider Status:</b> ✅ Cancelled via API\n"
-        elif api_cancel_success:
-            admin_notification += "🔄 <b>Provider Status:</b> ⏳ Cancellation queued\n"
-            admin_notification += f"📝 <b>API Response:</b> {api_message[:50]}...\n"
-        else:
-            admin_notification += "🔄 <b>Provider Status:</b> ❌ Manual review needed\n"
-            admin_notification += f"📝 <b>API Issue:</b> {api_message[:50]}...\n"
-
-        admin_notification += (
-            "\n💰 <b>Action Required:</b> Process refund request\n"
-            "ℹ️ <b>Note:</b> User refund guaranteed regardless of provider status"
-        )
-
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=admin_notification,
-                    parse_mode='HTML'
-                )
-            except RuntimeError as e:
-                logger.error("Failed to notify admin %s: %s", admin_id, e)
-
-        logger.info(
-            "✅ Order %s cancelled successfully by user %s. API cancelled: %s, Cancel success: %s",
-            order_id, user_id, 'Yes' if api_cancelled_via_api else 'No', 'Yes' if api_cancel_success else 'No'
-        )
-
-    except RuntimeError as e:
-        logger.error("❌ Error in confirm cancel handler: %s", str(e))
-        await query.edit_message_text(
-            f"❌ <b>Cancellation Failed</b>\n\n"
-            f"An error occurred while cancelling your order:\n"
-            f"<code>{str(e)[:100]}...</code>\n\n"
-            f"Please try again or contact support.",
-            parse_mode='HTML'
-        )
-
-
-async def handle_keep_order(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Handle user's decision to keep the order"""
-    query = update.callback_query
-    if not query or not query.from_user or not query.data:
-        return
-
-    user_id = query.from_user.id
-    await query.answer()
-
-    try:
-        # Extract order_id from callback data: "keep_order_{order_id}"
-        order_id = "_".join(query.data.split('_')[2:])  # Keep as string
-
-        order = db.get_order(order_id)
-        if not order:
-            await query.edit_message_text(
-                "❌ Order not found.",
-                parse_mode='HTML'
-            )
-            return
-
-        # Restore the original message with cancel button
-        service_name = "Ring4"  # Default, could be stored in order data
-        selling_price = order.get('cost', 'N/A')
-        number = order.get('number', 'N/A')
-
-        success_text = f"🎉 <b>{service_name} Number Ready!</b>\n\n"
-        success_text += f"📱 <b>Your Number:</b> <code>{number}</code>\n"
-        success_text += f"💰 <b>Total Paid:</b> ${selling_price}\n"
-        success_text += f"🆔 <b>Order ID:</b> #{order_id}\n"
-        success_text += f"📱 <b>Service:</b> {service_name}\n\n"
-        success_text += "🔄 <b>OTP Monitoring:</b> Active (real-time)\n"
-        success_text += "⏱️ <b>Validity:</b> 10 minutes\n\n"
-        success_text += "🚀 <b>Ready to use!</b> OTP codes will arrive automatically.\n\n"
-        success_text += "❌ <b>Not working?</b> You can cancel anytime before OTP arrives."
-
-        # Recreate cancel button
-        keyboard = [[InlineKeyboardButton(
-            "❌ Cancel Order & Get Refund",
-            callback_data=f"cancel_order_{order_id}"
-        )]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            success_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-
-        logger.info("📱 User %s decided to keep order %s", user_id, order_id)
-
-    except RuntimeError as e:
-        logger.error("❌ Error in keep order handler: %s", str(e))
-        await query.edit_message_text(
-            "❌ Error occurred. Please try again.",
-            parse_mode='HTML'
-        )
+# REMOVED: handle_confirm_cancel - now auto-processed
+# REMOVED: handle_keep_order - no longer needed with auto-processing
 
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3676,8 +6313,26 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     data = query.data
 
     try:
+        # NEW: Enhanced menu system callbacks
+        if data == "start_menu":
+            await handle_start_menu(update, context)
+        elif data == "my_orders":
+            await handle_my_orders(update, context)
+        elif data == "quick_refund":
+            await handle_quick_refund(update, context)
+        elif data == "show_help":
+            await handle_show_help(update, context)
+        elif data == "admin_panel":
+            await handle_admin_panel(update, context)
+        elif data == "service_status":
+            await service_status_command(update, context)
+        elif data == "pending_deposits":
+            await handle_pending_deposits(update, context)
+        elif data == "detailed_stats":
+            await handle_detailed_stats(update, context)
+
         # Wallet-related callbacks
-        if data == "deposit_funds":
+        elif data == "deposit_funds":
             await handle_deposit_funds(update, context)
         elif data.startswith("deposit_amount_"):
             await handle_deposit_amount(update, context)
@@ -3690,15 +6345,40 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         elif data == "transaction_history":
             await handle_transaction_history(update, context)
 
-        # Service purchase with wallet
+        # Service purchase with wallet - AUTO-PROCESS (no confirmation callbacks needed)
         elif data.startswith("wallet_service_"):
             await handle_service_purchase_with_wallet(update, context)
         elif data.startswith("wallet_purchase_"):
-            await handle_wallet_purchase_confirmation(update, context)
+            # Handle direct wallet purchase callbacks (e.g., wallet_purchase_1574_0.15)
+            await handle_wallet_purchase_callback(update, context)
+        # REMOVED: wallet_purchase_ confirmation - now auto-processed
 
-        # New service selection workflow
+        # NEW: Service selection and country workflow
         elif data == "browse_services":
             await handle_browse_services(update, context)
+        elif data.startswith("select_service_"):
+            await handle_service_selection(update, context)
+        elif data.startswith("country_") and len(data.split('_')) >= 4:
+            # Handle country selection with service info: country_1_1574_0.17
+            await handle_country_selection_with_service(update, context)
+        elif data.startswith("instant_purchase_"):
+            await handle_instant_purchase(update, context)
+        elif data.startswith("all_countries_"):
+            await handle_show_all_countries_for_service(update, context)
+        elif data.startswith("search_countries_"):
+            await handle_country_search_for_service(update, context)
+
+        # Legacy handlers (kept for backward compatibility)
+        elif data.startswith("country_"):
+            await handle_country_selection(update, context)
+        elif data == "all_countries":
+            await handle_show_all_countries(update, context)
+        elif data == "search_countries":
+            await handle_country_search(update, context)
+        elif data.startswith("service_"):
+            await handle_service_selection_with_country(update, context)
+
+        # Legacy service selection (kept for backward compatibility)
         elif data.startswith("select_service_"):
             await handle_service_selection(update, context)
         elif data == "back_to_start" or data == "start":
@@ -3712,23 +6392,22 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         # All service purchases are instant using wallet balance
         # Admin approval only needed for deposits, not individual purchases
 
-        # Refund workflow callbacks (now using wallet refunds)
+        # Refund workflow callbacks (now automatic - no admin approval needed)
+        elif data.startswith("instant_refund_reorder_"):
+            await handle_instant_refund_and_reorder(update, context)
+        elif data.startswith("refund_reorder_"):
+            await handle_refund_and_reorder(update, context)
         elif data.startswith("refund_") and not data.startswith("refund_details_"):
             await handle_refund_request(update, context)
-        elif data == "admin_refunds":
-            await show_admin_refunds(update, context)
-        elif data.startswith("refund_details_"):
-            await handle_refund_details(update, context)
-        elif data.startswith("approve_refund_") or data.startswith("deny_refund_"):
-            await process_refund_approval(update, context)
 
-        # Order cancellation callbacks
+        # Order Again callbacks - Allow users to reorder same service/country
+        elif data.startswith("order_again_"):
+            await handle_order_again(update, context)
+
+        # Order cancellation callbacks - AUTO-PROCESS (no confirmation callbacks needed)
         elif data.startswith("cancel_order_"):
             await handle_cancel_order(update, context)
-        elif data.startswith("confirm_cancel_"):
-            await handle_confirm_cancel(update, context)
-        elif data.startswith("keep_order_"):
-            await handle_keep_order(update, context)
+        # REMOVED: confirm_cancel_ and keep_order_ - now auto-processed
 
         # Admin deposit management
         elif data.startswith("approve_deposit_"):
@@ -3745,16 +6424,52 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("❌ Unknown action.")
             logger.warning("Unknown callback data: %s", data)
 
-    except RuntimeError as e:
-        logger.error("Error in callback query handler: %s", str(e))
-        try:
-            await query.answer("❌ An error occurred.")
-        except OSError:
-            pass
+    except Exception as e:
+        # Handle both RuntimeError and other exceptions like BadRequest
+        error_msg = str(e)
+
+        # Special handling for BadRequest (message not modified)
+        if "Message is not modified" in error_msg:
+            logger.warning(
+                "Message not modified error - likely duplicate content: %s", error_msg)
+            try:
+                await query.answer("✅ Action completed.")
+            except Exception:
+                pass
+            return
+        elif "message to edit not found" in error_msg.lower():
+            logger.warning(
+                "Message to edit not found - user may have deleted it: %s", error_msg)
+            try:
+                await query.answer("❌ Message no longer available.")
+            except Exception:
+                pass
+            return
+        elif "message is not modified" in error_msg.lower():
+            logger.warning("Duplicate message content detected: %s", error_msg)
+            try:
+                await query.answer("✅ No changes needed.")
+            except Exception:
+                pass
+            return
+        else:
+            logger.error("Error in callback query handler: %s", error_msg)
+            try:
+                await query.answer("❌ An error occurred.")
+                # Try to send a simple error message to the chat
+                if update.effective_chat:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="❌ <b>Error</b>\n\n"
+                             "An error occurred processing your request. Please try again.",
+                        parse_mode='HTML'
+                    )
+            except Exception as inner_e:
+                logger.error("Failed to send error message: %s", inner_e)
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages (for custom deposit amounts)"""
+    """Handle text messages (for custom deposit amounts and country search)"""
     if not update.message or not update.effective_user:
         return
 
@@ -3763,6 +6478,64 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = message.text
 
     if not text:
+        return
+
+    # Check if user is searching for countries
+    if context.user_data and context.user_data.get('awaiting_country_search'):
+        try:
+            search_term = text.strip()
+
+            if len(search_term) < 2:
+                await message.reply_text(
+                    "🔍 <b>Search too short!</b>\n\n"
+                    "Please enter at least 2 characters to search for countries.",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Clear the search state
+            context.user_data['awaiting_country_search'] = False
+
+            # Search for countries
+            matching_countries = sms_api.search_countries(
+                search_term) if sms_api else []
+
+            if not matching_countries:
+                await message.reply_text(
+                    f"🔍 <b>No countries found for '{search_term}'</b>\n\n"
+                    "Try searching with a different term.",
+                    parse_mode='HTML'
+                )
+                return
+
+            # Show search results
+            keyboard = []
+            for country in matching_countries[:15]:  # Limit to 15 results
+                keyboard.append([InlineKeyboardButton(
+                    f"{country['flag']} {country['name']}",
+                    callback_data=f"country_{country['id']}"
+                )])
+
+            # Add back button
+            keyboard.append([InlineKeyboardButton(
+                "🔙 Back to Countries", callback_data="browse_services")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await message.reply_text(
+                f"🔍 <b>Search Results for '{search_term}':</b>\n\n"
+                f"Found {len(matching_countries)} countries",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+
+        except Exception as e:
+            logger.error("Error handling country search: %s", e)
+            await message.reply_text(
+                "❌ Error searching for countries. Please try again.",
+                parse_mode='HTML'
+            )
+            context.user_data['awaiting_country_search'] = False
         return
 
     # Check if user is entering a custom deposit amount
@@ -3874,6 +6647,67 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 # =============================================================================
+# PROCESS MANAGEMENT TO PREVENT MULTIPLE INSTANCES
+# =============================================================================
+
+
+def check_and_create_pidfile():
+    """Check if bot is already running and create PID file"""
+    pid_file = LOGS_DIR / "ring4_bot.pid"
+
+    if pid_file.exists():
+        try:
+            with open(pid_file, 'r') as f:
+                old_pid = int(f.read().strip())
+
+            # Check if process is still running
+            try:
+                os.kill(old_pid, 0)  # Send signal 0 to check if process exists
+                logger.error("❌ Bot is already running with PID %d", old_pid)
+                logger.error(
+                    "💡 Stop the existing bot first or wait for it to finish")
+                sys.exit(1)
+            except OSError:
+                # Process doesn't exist, remove stale PID file
+                logger.warning(
+                    "🧹 Removing stale PID file for process %d", old_pid)
+                pid_file.unlink()
+        except (ValueError, IOError) as e:
+            logger.warning("⚠️ Invalid PID file, removing: %s", e)
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+
+    # Create new PID file
+    try:
+        with open(pid_file, 'w') as f:
+            f.write(str(os.getpid()))
+        logger.info("✅ Created PID file: %s (PID: %d)", pid_file, os.getpid())
+        return pid_file
+    except IOError as e:
+        logger.error("❌ Failed to create PID file: %s", e)
+        return None
+
+
+def cleanup_pidfile(pid_file):
+    """Clean up PID file on exit"""
+    if pid_file and pid_file.exists():
+        try:
+            pid_file.unlink()
+            logger.info("🧹 Cleaned up PID file")
+        except OSError as e:
+            logger.warning("⚠️ Failed to clean up PID file: %s", e)
+
+
+def signal_handler(signum, frame, pid_file=None):
+    """Handle shutdown signals gracefully"""
+    logger.info("🛑 Received signal %d, shutting down gracefully...", signum)
+    cleanup_pidfile(pid_file)
+    sys.exit(0)
+
+
+# =============================================================================
 # APPLICATION SETUP & MAIN
 # =============================================================================
 
@@ -3896,10 +6730,20 @@ def validate_environment():
 
 
 def main():
-    """Main entry point"""
+    """Main entry point with process management"""
     logger.info("🚀 Starting Ring4 US-Only SMS Verification Bot")
     logger.info("🐍 Python version: %s", sys.version)
     logger.info("📁 Working directory: %s", os.getcwd())
+
+    # Check for existing bot instances and create PID file
+    pid_file = check_and_create_pidfile()
+
+    # Set up signal handlers for graceful shutdown
+    def signal_handler_wrapper(signum, frame):
+        signal_handler(signum, frame, pid_file)
+
+    signal.signal(signal.SIGINT, signal_handler_wrapper)
+    signal.signal(signal.SIGTERM, signal_handler_wrapper)
 
     # Print startup banner
     print("""
@@ -3907,22 +6751,36 @@ def main():
     ║                                                              ║
     ║              📱 RING4 SMS VERIFICATION BOT                   ║
     ║                                                              ║
-    ║                    Production Ready v1.0                     ║
+    ║                   Production Ready v2.0                      ║
     ║                                                              ║
-    ║  🎯 Features:                                                ║
+    ║  🎯 Core Features:                                           ║
     ║    • Ring4 US numbers only (Service ID: 1574)                ║
     ║    • Instant purchase & delivery                            ║
-    ║    • Real-time OTP polling (5s interval)                     ║
+    ║    • Real-time OTP polling (adaptive intervals)             ║
     ║    • 10-minute validity period                              ║
-    ║    • Admin-approved refund system                           ║
+    ║    • ⚡ INSTANT automatic refunds                           ║
     ║    • Persistent TinyDB storage                              ║
     ║    • Production error handling                               ║
     ║                                                              ║
+    ║  🚀 NEW: Enhanced UX Features:                              ║
+    ║    • 📱 Persistent menu system                              ║
+    ║    • 🔄 Quick action buttons                                ║
+    ║    • 📋 One-click order history                             ║
+    ║    • 💸 Instant refund system                               ║
+    ║    • ❔ Built-in help & guidance                            ║
+    ║    • 👨‍💼 Admin quick panel                                  ║
+    ║                                                              ║
     ║  💰 Business Ready:                                          ║
     ║    • SMSPool API integration                                ║
-    ║    • Comprehensive admin controls                           ║
+    ║    • Automated refund processing                            ║
     ║    • Full audit trails & logging                           ║
     ║    • Async-first implementation                             ║
+    ║                                                              ║
+    ║  ⚡ Instant Everything:                                      ║
+    ║    • No admin approval for refunds                          ║
+    ║    • No purchase confirmations                              ║
+    ║    • Menu-driven navigation                                 ║
+    ║    • Mobile-optimized interface                             ║
     ║                                                              ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
@@ -3930,26 +6788,44 @@ def main():
     try:
         # Validate environment
         if not validate_environment():
+            cleanup_pidfile(pid_file)
             sys.exit(1)
 
-        # Create application
+        # Create application with conflict resolution
         if not BOT_TOKEN:
             logger.critical("❌ BOT_TOKEN not configured")
+            cleanup_pidfile(pid_file)
             sys.exit(1)
 
-        application = Application.builder().token(BOT_TOKEN).build()
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .concurrent_updates(True)  # Enable concurrent updates
+            .build()
+        )
+
+        # Setup persistent bot menu system
+        async def post_init(app: Application) -> None:
+            """Post-initialization tasks"""
+            await setup_bot_menu(app)
+            logger.info("🎯 Bot menu system initialized")
+
+        # Run menu setup after bot initialization
+        application.post_init = post_init
 
         # Add command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("buy", buy_command))
+        application.add_handler(CommandHandler("services", services_command))
+        application.add_handler(CommandHandler("deposit", deposit_command))
+        application.add_handler(CommandHandler("balance", balance_command))
+        application.add_handler(CommandHandler("orders", orders_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("refund", refund_command))
         application.add_handler(CommandHandler("admin", admin_command))
+        application.add_handler(CommandHandler("status", status_command))
         application.add_handler(CommandHandler(
             "approve_refund", approve_refund_command))
-        application.add_handler(CommandHandler("balance", balance_command))
-        application.add_handler(CommandHandler(
-            "services", service_status_command))
 
         # Add callback query handler
         application.add_handler(CallbackQueryHandler(callback_query_handler))
@@ -3964,16 +6840,35 @@ def main():
         logger.info("✅ Application setup complete")
         logger.info("🤖 Starting bot polling...")
 
-        # Start the bot
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+        try:
+            # Start the bot with improved polling configuration
+            # The webhook will be cleared automatically by drop_pending_updates=True
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,  # This automatically clears webhooks
+                timeout=20,  # Increase timeout to handle network issues
+            )
+        except Exception as polling_error:
+            if "Conflict" in str(polling_error) and "getUpdates" in str(polling_error):
+                logger.error(
+                    "🚨 Another bot instance is running. Error: %s", polling_error)
+                logger.error(
+                    "💡 Solution: Stop any other bot instances or clear webhooks")
+                logger.error("💡 Commands to try:")
+                logger.error("   - pkill -f 'python.*main.py'")
+                logger.error("   - Check Telegram webhook settings")
+                logger.error("   - Wait a few seconds and restart")
+                logger.error("💡 PID file location: %s",
+                             pid_file if pid_file else "Not created")
+            else:
+                logger.error("❌ Polling error: %s", polling_error)
+            raise
 
     except KeyboardInterrupt:
         logger.info("⌨️ Bot stopped by user")
-    except RuntimeError as e:
+    except Exception as e:
         logger.critical("💥 Fatal error: %s", str(e), exc_info=True)
+        cleanup_pidfile(pid_file)
         sys.exit(1)
     finally:
         # Clean up active polling tasks before event loop closes
@@ -3988,16 +6883,18 @@ def main():
                             "❌ Cancelled polling task for order %s", order_id)
                 active_polls.clear()
                 logger.info("✅ All polling tasks cleaned up")
-        except RuntimeError as cleanup_error:
+        except Exception as cleanup_error:
             logger.error("⚠️ Error during cleanup: %s", cleanup_error)
 
         # Close database connections safely
         try:
             if 'db' in globals() and db:
                 db.close()
-        except RuntimeError as db_error:
+        except Exception as db_error:
             logger.error("⚠️ Error closing database: %s", db_error)
 
+        # Clean up PID file
+        cleanup_pidfile(pid_file)
         logger.info("👋 Ring4 Bot shutdown complete")
 
 

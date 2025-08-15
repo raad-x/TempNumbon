@@ -7,10 +7,166 @@ from typing import Dict, Any, Optional, List
 logger = logging.getLogger(__name__)
 
 
+# Popular countries at the top for easy access
+POPULAR_COUNTRIES = [
+    {"id": 1, "name": "United States", "code": "US", "flag": "🇺🇸"},
+    {"id": 2, "name": "United Kingdom", "code": "GB", "flag": "🇬🇧"},
+    {"id": 3, "name": "Canada", "code": "CA", "flag": "🇨🇦"},
+    {"id": 7, "name": "France", "code": "FR", "flag": "🇫🇷"},
+    {"id": 9, "name": "Germany", "code": "DE", "flag": "🇩🇪"},
+    {"id": 16, "name": "Netherlands", "code": "NL", "flag": "🇳🇱"},
+    {"id": 22, "name": "Australia", "code": "AU", "flag": "🇦🇺"},
+    {"id": 32, "name": "Sweden", "code": "SE", "flag": "🇸🇪"},
+    {"id": 33, "name": "Norway", "code": "NO", "flag": "🇳🇴"},
+    {"id": 38, "name": "Poland", "code": "PL", "flag": "🇵🇱"},
+]
+
+
+# Full country list with SMSPool country IDs
+ALL_COUNTRIES = [
+    {"id": 1, "name": "United States", "code": "US", "flag": "🇺🇸"},
+    {"id": 2, "name": "United Kingdom", "code": "GB", "flag": "🇬🇧"},
+    {"id": 3, "name": "Canada", "code": "CA", "flag": "🇨🇦"},
+    {"id": 4, "name": "Israel", "code": "IL", "flag": "🇮🇱"},
+    {"id": 5, "name": "Russia", "code": "RU", "flag": "🇷🇺"},
+    {"id": 6, "name": "Ukraine", "code": "UA", "flag": "🇺🇦"},
+    {"id": 7, "name": "France", "code": "FR", "flag": "🇫🇷"},
+    {"id": 8, "name": "Kazakhstan", "code": "KZ", "flag": "🇰🇿"},
+    {"id": 9, "name": "Germany", "code": "DE", "flag": "🇩🇪"},
+    {"id": 10, "name": "China", "code": "CN", "flag": "🇨🇳"},
+    {"id": 11, "name": "Belarus", "code": "BY", "flag": "🇧🇾"},
+    {"id": 12, "name": "Kyrgyzstan", "code": "KG", "flag": "🇰🇬"},
+    {"id": 13, "name": "Latvia", "code": "LV", "flag": "🇱🇻"},
+    {"id": 14, "name": "Moldova", "code": "MD", "flag": "🇲🇩"},
+    {"id": 15, "name": "Estonia", "code": "EE", "flag": "🇪🇪"},
+    {"id": 16, "name": "Netherlands", "code": "NL", "flag": "🇳🇱"},
+    {"id": 17, "name": "Lithuania", "code": "LT", "flag": "🇱🇹"},
+    {"id": 18, "name": "Georgia", "code": "GE", "flag": "🇬🇪"},
+    {"id": 19, "name": "Romania", "code": "RO", "flag": "🇷🇴"},
+    {"id": 20, "name": "Uzbekistan", "code": "UZ", "flag": "🇺🇿"},
+    {"id": 21, "name": "Croatia", "code": "HR", "flag": "🇭🇷"},
+    {"id": 22, "name": "Australia", "code": "AU", "flag": "🇦🇺"},
+    {"id": 23, "name": "Armenia", "code": "AM", "flag": "🇦🇲"},
+    {"id": 24, "name": "Azerbaijan", "code": "AZ", "flag": "🇦🇿"},
+    {"id": 25, "name": "Spain", "code": "ES", "flag": "🇪🇸"},
+    {"id": 26, "name": "Italy", "code": "IT", "flag": "🇮🇹"},
+    {"id": 27, "name": "Bulgaria", "code": "BG", "flag": "🇧🇬"},
+    {"id": 28, "name": "Czech Republic", "code": "CZ", "flag": "🇨🇿"},
+    {"id": 29, "name": "Finland", "code": "FI", "flag": "🇫🇮"},
+    {"id": 30, "name": "Hungary", "code": "HU", "flag": "🇭🇺"},
+    {"id": 31, "name": "Denmark", "code": "DK", "flag": "🇩🇰"},
+    {"id": 32, "name": "Sweden", "code": "SE", "flag": "🇸🇪"},
+    {"id": 33, "name": "Norway", "code": "NO", "flag": "🇳🇴"},
+    {"id": 34, "name": "Austria", "code": "AT", "flag": "🇦🇹"},
+    {"id": 35, "name": "Belgium", "code": "BE", "flag": "🇧🇪"},
+    {"id": 36, "name": "Slovenia", "code": "SI", "flag": "🇸🇮"},
+    {"id": 37, "name": "Slovakia", "code": "SK", "flag": "🇸🇰"},
+    {"id": 38, "name": "Poland", "code": "PL", "flag": "🇵🇱"},
+    {"id": 39, "name": "Greece", "code": "GR", "flag": "🇬🇷"},
+    {"id": 40, "name": "Switzerland", "code": "CH", "flag": "🇨🇭"},
+    {"id": 41, "name": "Portugal", "code": "PT", "flag": "🇵🇹"},
+    {"id": 42, "name": "Ireland", "code": "IE", "flag": "🇮🇪"},
+    {"id": 43, "name": "Luxembourg", "code": "LU", "flag": "🇱🇺"},
+    {"id": 44, "name": "Malta", "code": "MT", "flag": "🇲🇹"},
+    {"id": 45, "name": "Iceland", "code": "IS", "flag": "🇮🇸"},
+    {"id": 46, "name": "Albania", "code": "AL", "flag": "🇦🇱"},
+    {"id": 47, "name": "Montenegro", "code": "ME", "flag": "🇲🇪"},
+    {"id": 48, "name": "Serbia", "code": "RS", "flag": "🇷🇸"},
+    {"id": 49, "name": "Bosnia and Herzegovina", "code": "BA", "flag": "🇧🇦"},
+    {"id": 50, "name": "North Macedonia", "code": "MK", "flag": "🇲🇰"},
+    {"id": 51, "name": "Turkey", "code": "TR", "flag": "🇹🇷"},
+    {"id": 52, "name": "Cyprus", "code": "CY", "flag": "🇨🇾"},
+    {"id": 53, "name": "Japan", "code": "JP", "flag": "🇯🇵"},
+    {"id": 54, "name": "South Korea", "code": "KR", "flag": "🇰🇷"},
+    {"id": 55, "name": "India", "code": "IN", "flag": "🇮🇳"},
+    {"id": 56, "name": "Thailand", "code": "TH", "flag": "🇹🇭"},
+    {"id": 57, "name": "Vietnam", "code": "VN", "flag": "🇻🇳"},
+    {"id": 58, "name": "Philippines", "code": "PH", "flag": "🇵🇭"},
+    {"id": 59, "name": "Indonesia", "code": "ID", "flag": "🇮🇩"},
+    {"id": 60, "name": "Malaysia", "code": "MY", "flag": "🇲🇾"},
+    {"id": 61, "name": "Singapore", "code": "SG", "flag": "🇸🇬"},
+    {"id": 62, "name": "Bangladesh", "code": "BD", "flag": "🇧🇩"},
+    {"id": 63, "name": "Pakistan", "code": "PK", "flag": "🇵🇰"},
+    {"id": 64, "name": "Sri Lanka", "code": "LK", "flag": "🇱🇰"},
+    {"id": 65, "name": "Myanmar", "code": "MM", "flag": "🇲🇲"},
+    {"id": 66, "name": "Cambodia", "code": "KH", "flag": "🇰🇭"},
+    {"id": 67, "name": "Laos", "code": "LA", "flag": "🇱🇦"},
+    {"id": 68, "name": "Nepal", "code": "NP", "flag": "🇳🇵"},
+    {"id": 69, "name": "Bhutan", "code": "BT", "flag": "🇧🇹"},
+    {"id": 70, "name": "Maldives", "code": "MV", "flag": "🇲🇻"},
+    {"id": 71, "name": "Hong Kong", "code": "HK", "flag": "🇭🇰"},
+    {"id": 72, "name": "Macau", "code": "MO", "flag": "🇲🇴"},
+    {"id": 73, "name": "Taiwan", "code": "TW", "flag": "🇹🇼"},
+    {"id": 74, "name": "Brazil", "code": "BR", "flag": "🇧🇷"},
+    {"id": 75, "name": "Mexico", "code": "MX", "flag": "🇲🇽"},
+    {"id": 76, "name": "Argentina", "code": "AR", "flag": "🇦🇷"},
+    {"id": 77, "name": "Chile", "code": "CL", "flag": "🇨🇱"},
+    {"id": 78, "name": "Colombia", "code": "CO", "flag": "🇨🇴"},
+    {"id": 79, "name": "Peru", "code": "PE", "flag": "🇵🇪"},
+    {"id": 80, "name": "Venezuela", "code": "VE", "flag": "🇻🇪"},
+    {"id": 81, "name": "Ecuador", "code": "EC", "flag": "🇪🇨"},
+    {"id": 82, "name": "Bolivia", "code": "BO", "flag": "🇧🇴"},
+    {"id": 83, "name": "Paraguay", "code": "PY", "flag": "🇵🇾"},
+    {"id": 84, "name": "Uruguay", "code": "UY", "flag": "🇺🇾"},
+    {"id": 85, "name": "Guyana", "code": "GY", "flag": "🇬🇾"},
+    {"id": 86, "name": "Suriname", "code": "SR", "flag": "🇸🇷"},
+    {"id": 87, "name": "French Guiana", "code": "GF", "flag": "🇬🇫"},
+    {"id": 88, "name": "South Africa", "code": "ZA", "flag": "🇿🇦"},
+    {"id": 89, "name": "Egypt", "code": "EG", "flag": "🇪🇬"},
+    {"id": 90, "name": "Nigeria", "code": "NG", "flag": "🇳🇬"},
+    {"id": 91, "name": "Kenya", "code": "KE", "flag": "🇰🇪"},
+    {"id": 92, "name": "Ghana", "code": "GH", "flag": "🇬🇭"},
+    {"id": 93, "name": "Morocco", "code": "MA", "flag": "🇲🇦"},
+    {"id": 94, "name": "Algeria", "code": "DZ", "flag": "🇩🇿"},
+    {"id": 95, "name": "Tunisia", "code": "TN", "flag": "🇹🇳"},
+    {"id": 96, "name": "Libya", "code": "LY", "flag": "🇱🇾"},
+    {"id": 97, "name": "Sudan", "code": "SD", "flag": "🇸🇩"},
+    {"id": 98, "name": "Ethiopia", "code": "ET", "flag": "🇪🇹"},
+    {"id": 99, "name": "Uganda", "code": "UG", "flag": "🇺🇬"},
+    {"id": 100, "name": "Tanzania", "code": "TZ", "flag": "🇹🇿"},
+]
+
+
 class SMSPoolAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.smspool.net"
+
+    def get_countries_list(self, popular_only: bool = False) -> List[Dict[str, Any]]:
+        """Get list of available countries"""
+        if popular_only:
+            return POPULAR_COUNTRIES.copy()
+        return ALL_COUNTRIES.copy()
+
+    def search_countries(self, query: str) -> List[Dict[str, Any]]:
+        """Search countries by name or code"""
+        query = query.lower().strip()
+        if not query:
+            return self.get_countries_list(popular_only=True)
+
+        results = []
+        for country in ALL_COUNTRIES:
+            if (query in country["name"].lower() or
+                    query in country["code"].lower()):
+                results.append(country)
+
+        # Limit results to prevent overwhelming UI
+        return results[:15]
+
+    def get_country_by_id(self, country_id: int) -> Optional[Dict[str, Any]]:
+        """Get country details by ID"""
+        for country in ALL_COUNTRIES:
+            if country["id"] == country_id:
+                return country
+        return None
+
+    def get_country_by_code(self, country_code: str) -> Optional[Dict[str, Any]]:
+        """Get country details by country code"""
+        country_code = country_code.upper().strip()
+        for country in ALL_COUNTRIES:
+            if country["code"] == country_code:
+                return country
+        return None
 
     async def check_balance(self) -> Dict[str, Any]:
         """Check account balance with enhanced error handling"""
@@ -105,6 +261,12 @@ class SMSPoolAPI:
         """Purchase a Ring4 US number with smart service fallback and pricing transparency"""
         logger.info("🎯 Starting Ring4 purchase with smart fallback...")
 
+        # Get country info for logging
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
+        logger.info(f"🌍 Target country: {country_name} (ID: {country_id})")
+
         # Define alternative services with expected pricing
         alternative_services = [
             {'id': 1574, 'name': 'Ring4', 'expected_price': 0.17},
@@ -120,10 +282,10 @@ class SMSPoolAPI:
             expected_price = service['expected_price']
 
             logger.info(
-                f"🔄 Attempting {service_name} (ID: {service_id}, expected: ${expected_price})")
+                f"🔄 Attempting {service_name} (ID: {service_id}, expected: ${expected_price}) for {country_name}")
 
             try:
-                result = await self._purchase_sms_service(service_id, service_name)
+                result = await self._purchase_sms_service(service_id, service_name, country_id)
                 if result.get('success'):
                     # Calculate price warning
                     actual_cost = float(result.get('cost', expected_price))
@@ -132,7 +294,7 @@ class SMSPoolAPI:
                         # Ring4 worked, no warning needed
                         result['price_warning'] = None
                         logger.info(
-                            f"✅ Ring4 purchase successful at ${actual_cost}")
+                            f"✅ Ring4 purchase successful at ${actual_cost} for {country_name}")
                     else:
                         # Alternative service used
                         price_difference = round(
@@ -144,25 +306,31 @@ class SMSPoolAPI:
                             'price_difference': price_difference
                         }
                         logger.info(
-                            f"✅ {service_name} purchase successful at ${actual_cost} (Ring4 unavailable)")
+                            f"✅ {service_name} purchase successful at ${actual_cost} for {country_name} (Ring4 unavailable)")
 
+                    # Add country info to result
+                    result['country'] = country_name
+                    result['country_id'] = country_id
                     return result
                 else:
                     logger.warning(
-                        f"⚠️ {service_name} failed: {result.get('message', 'Unknown error')}")
+                        f"⚠️ {service_name} failed for {country_name}: {result.get('message', 'Unknown error')}")
             except Exception as e:
-                logger.error(f"❌ {service_name} exception: {str(e)}")
+                logger.error(
+                    f"❌ {service_name} exception for {country_name}: {str(e)}")
                 continue
 
         # If all services failed
-        logger.error("❌ All SMS services failed")
+        logger.error(f"❌ All SMS services failed for {country_name}")
         return {
             'success': False,
-            'message': 'All SMS services are currently unavailable. Please try again later.',
-            'price_warning': None
+            'message': f'All SMS services are currently unavailable for {country_name}. Please try again later.',
+            'price_warning': None,
+            'country': country_name,
+            'country_id': country_id
         }
 
-    async def _purchase_sms_service(self, service_id: int, service_name: str) -> Dict[str, Any]:
+    async def _purchase_sms_service(self, service_id: int, service_name: str, country_id: int = 1) -> Dict[str, Any]:
         """Internal method to purchase from a specific SMS service with enhanced error handling"""
         if not self.api_key or self.api_key.strip() == "":
             return {'success': False, 'message': 'API key not configured'}
@@ -171,12 +339,16 @@ class SMSPoolAPI:
         params = {
             'key': self.api_key,
             'service': service_id,
-            'country': 1,  # USA
+            'country': country_id,  # Use the provided country_id
             'pool': ''  # Auto-select best pool
         }
 
+        # Get country info for logging
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
         logger.info(
-            f"🔄 Attempting {service_name} purchase (Service: {service_id})")
+            f"🔄 Attempting {service_name} purchase (Service: {service_id}, Country: {country_name})")
 
         try:
             timeout = aiohttp.ClientTimeout(total=30)
@@ -224,14 +396,15 @@ class SMSPoolAPI:
                                 # Some services might not return number immediately, but order_id is essential
 
                             logger.info(
-                                f"✅ {service_name} number purchased: {number} (Order: {order_id})")
+                                f"✅ {service_name} number purchased: {number} (Order: {order_id}) for {country_name}")
                             return {
                                 'success': True,
                                 'order_id': str(order_id),
                                 'number': str(number) if number else 'Pending',
                                 'cost': str(data.get('cost', '0.15')),
                                 'service': service_name,
-                                'country': 'US'
+                                'country': country_name,
+                                'country_id': country_id
                             }
                         else:
                             # Parse error message
@@ -435,8 +608,8 @@ class SMSPoolAPI:
                 'message': f'Network error: {str(e)}'
             }
 
-    async def get_service_pricing(self, services: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        """Get current pricing for multiple services"""
+    async def get_service_pricing(self, services: Optional[List[Dict[str, Any]]] = None, country_id: int = 1) -> Dict[str, Any]:
+        """Get current pricing for multiple services in a specific country"""
         if services is None:
             services = [
                 {'id': 1574, 'name': 'Ring4'},
@@ -445,23 +618,30 @@ class SMSPoolAPI:
                 {'id': 1012, 'name': 'WhatsApp'},
             ]
 
+        # Get country info
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
         pricing_info = []
         available_services = []
+
+        logger.info(f"🔍 Checking service pricing for {country_name}")
 
         for service in services:
             service_id = service['id']
             service_name = service['name']
 
-            # Check availability and pricing
-            # US country
-            availability = await self.check_service_availability(service_id, 1)
+            # Check availability and pricing for the specified country
+            availability = await self.check_service_availability(service_id, country_id)
 
             pricing_data = {
                 'id': service_id,
                 'name': service_name,
                 'available': availability.get('available', False),
                 'price': availability.get('price', '0'),
-                'message': availability.get('message', 'Unknown status')
+                'message': availability.get('message', 'Unknown status'),
+                'country': country_name,
+                'country_id': country_id
             }
 
             pricing_info.append(pricing_data)
@@ -480,26 +660,32 @@ class SMSPoolAPI:
             'all_services': pricing_info,
             'available_services': available_services,
             'cheapest_available': cheapest_service,
-            'ring4_status': next((s for s in pricing_info if s['id'] == 1574), None)
+            'ring4_status': next((s for s in pricing_info if s['id'] == 1574), None),
+            'country': country_name,
+            'country_id': country_id
         }
 
-    async def get_available_services_for_purchase(self) -> Dict[str, Any]:
-        """Get available services with selling prices for user selection"""
+    async def get_available_services_for_purchase(self, country_id: int = 1) -> Dict[str, Any]:
+        """Get available services with selling prices for user selection in specified country"""
         from src.config import Config
 
         services_to_check = Config.SERVICE_PRIORITY
         available_services = []
 
-        logger.info("🔍 Checking service availability for purchase menu...")
+        # Get country info
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
+        logger.info(
+            f"🔍 Checking service availability for purchase menu in {country_name}...")
 
         for service in services_to_check:
             service_id = service['id']
             service_name = service['name']
             service_description = service['description']
 
-            # Check availability and pricing
-            # US country
-            availability = await self.check_service_availability(service_id, 1)
+            # Check availability and pricing for the specified country
+            availability = await self.check_service_availability(service_id, country_id)
 
             if availability.get('available'):
                 api_price = float(availability.get('price', '0'))
@@ -515,17 +701,19 @@ class SMSPoolAPI:
                         'selling_price': selling_price,
                         'profit': profit,
                         'available': True,
-                        'recommended': service_id == 1574  # Ring4 is preferred
+                        'recommended': service_id == 1574,  # Ring4 is preferred
+                        'country': country_name,
+                        'country_id': country_id
                     }
                     available_services.append(service_info)
                     logger.info(
-                        f"✅ {service_name}: ${api_price} → ${selling_price} (profit: ${profit})")
+                        f"✅ {service_name} in {country_name}: ${api_price} → ${selling_price} (profit: ${profit})")
                 else:
                     logger.warning(
-                        f"⚠️ {service_name}: Available but no valid pricing")
+                        f"⚠️ {service_name} in {country_name}: Available but no valid pricing")
             else:
                 logger.warning(
-                    f"❌ {service_name}: {availability.get('message', 'Unavailable')}")
+                    f"❌ {service_name} in {country_name}: {availability.get('message', 'Unavailable')}")
 
         # Sort by preference (Ring4 first, then by price)
         available_services.sort(key=lambda x: (
@@ -535,23 +723,29 @@ class SMSPoolAPI:
             'success': True,
             'services': available_services,
             'count': len(available_services),
-            'profit_margin': Config.PROFIT_MARGIN_PERCENT
+            'profit_margin': Config.PROFIT_MARGIN_PERCENT,
+            'country': country_name,
+            'country_id': country_id
         }
 
-    async def _check_service_purchase_availability(self, service_id: int, service_name: str) -> Dict[str, Any]:
+    async def _check_service_purchase_availability(self, service_id: int, service_name: str, country_id: int = 1) -> Dict[str, Any]:
         """Check if a specific service is available for purchase by checking active services"""
         if not self.api_key or self.api_key.strip() == "":
             return {'available': False, 'message': 'API key not configured'}
 
+        # Get country info
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
         logger.info(
-            f"🔍 Checking {service_name} availability (Service: {service_id})")
+            f"🔍 Checking {service_name} availability in {country_name} (Service: {service_id})")
 
         try:
             # Get list of available services to check if this specific service is available
-            services_result = await self.get_available_services_for_purchase()
+            services_result = await self.get_available_services_for_purchase(country_id)
 
             if not services_result.get('success', False):
-                return {'available': False, 'message': f'Unable to check {service_name} availability'}
+                return {'available': False, 'message': f'Unable to check {service_name} availability in {country_name}'}
 
             services = services_result.get('services', [])
 
@@ -559,24 +753,29 @@ class SMSPoolAPI:
             for service in services:
                 if service.get('id') == service_id:
                     # Service is in the list, so it should be available
-                    return {'available': True, 'message': f'{service_name} is available for purchase'}
+                    return {'available': True, 'message': f'{service_name} is available for purchase in {country_name}'}
 
             # Service not found in available services list
-            return {'available': False, 'message': f'{service_name} service temporarily unavailable'}
+            return {'available': False, 'message': f'{service_name} service temporarily unavailable in {country_name}'}
 
         except Exception as e:
             logger.error(
-                f"❌ Unexpected error during {service_name} availability check: {str(e)}")
-            return {'available': False, 'message': f'Unexpected error checking {service_name} availability'}
+                f"❌ Unexpected error during {service_name} availability check in {country_name}: {str(e)}")
+            return {'available': False, 'message': f'Unexpected error checking {service_name} availability in {country_name}'}
 
-    async def purchase_specific_service(self, service_id: int, service_name: str) -> Dict[str, Any]:
-        """Purchase a specific service by ID with pricing info"""
+    async def purchase_specific_service(self, service_id: int, service_name: str, country_id: int = 1) -> Dict[str, Any]:
+        """Purchase a specific service by ID with pricing info for specified country"""
         from src.config import Config
 
-        logger.info(f"🛒 Purchasing {service_name} (ID: {service_id})")
+        # Get country info
+        country = self.get_country_by_id(country_id)
+        country_name = country["name"] if country else f"Country ID {country_id}"
+
+        logger.info(
+            f"🛒 Purchasing {service_name} (ID: {service_id}) in {country_name}")
 
         try:
-            result = await self._purchase_sms_service(service_id, service_name)
+            result = await self._purchase_sms_service(service_id, service_name, country_id)
 
             if result.get('success'):
                 # Add pricing information
@@ -588,18 +787,23 @@ class SMSPoolAPI:
                     'api_cost': api_cost,
                     'selling_price': selling_price,
                     'profit': profit,
-                    'service_selected': service_name
+                    'service_selected': service_name,
+                    'country': country_name,
+                    'country_id': country_id
                 })
 
                 logger.info(
-                    f"✅ {service_name} purchased: API=${api_cost}, Selling=${selling_price}, Profit=${profit}")
+                    f"✅ {service_name} purchased in {country_name}: API=${api_cost}, Selling=${selling_price}, Profit=${profit}")
 
             return result
         except Exception as e:
-            logger.error(f"❌ Error purchasing {service_name}: {str(e)}")
+            logger.error(
+                f"❌ Error purchasing {service_name} in {country_name}: {str(e)}")
             return {
                 'success': False,
-                'message': f'Error purchasing {service_name}: {str(e)}'
+                'message': f'Error purchasing {service_name} in {country_name}: {str(e)}',
+                'country': country_name,
+                'country_id': country_id
             }
 
     async def get_order_status(self, order_id: str) -> Dict[str, Any]:
@@ -745,126 +949,115 @@ class SMSPoolAPI:
             }
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """Cancel an order and request refund
+        """Cancel an order and request refund using correct SMS Pool API endpoints
 
-        Note: SMSPool may not have a direct cancel endpoint. This method attempts
-        multiple approaches and always returns success for user refund processing.
+        Based on API testing, SMS Pool uses /sms/cancel endpoint with key and orderid parameters.
+        Returns: {'success': 1, 'message': 'The order has been successfully archived.'} on success
         """
 
-        # Try multiple potential cancel endpoints
-        cancel_attempts = [
-            {
-                'url': f"{self.base_url}/request/cancel",
-                'params': {'key': self.api_key, 'orderid': order_id},
-                'method': 'GET'
-            },
-            {
-                'url': f"{self.base_url}/sms/cancel",
-                'params': {'key': self.api_key, 'orderid': order_id},
-                'method': 'GET'
-            },
-            {
-                'url': f"{self.base_url}/purchase/cancel",
-                'params': {'key': self.api_key, 'orderid': order_id},
-                'method': 'POST'
-            },
-            {
-                'url': f"{self.base_url}/stubs/handler_api",
-                'params': {'api_key': self.api_key, 'action': '8', 'id': order_id},
-                'method': 'GET'
-            }
-        ]
-
-        successful_cancellation = False
-        api_responses = []
+        # Use the correct SMS Pool cancel endpoint
+        url = f"{self.base_url}/sms/cancel"
+        params = {'key': self.api_key, 'orderid': order_id}
 
         try:
             timeout = aiohttp.ClientTimeout(total=15)
             connector = aiohttp.TCPConnector(ssl=False)
 
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                for attempt in cancel_attempts:
-                    try:
-                        if attempt['method'] == 'GET':
-                            async with session.get(attempt['url'], params=attempt['params']) as response:
-                                status = response.status
-                                if status == 200:
-                                    try:
-                                        data = await response.json()
-                                        api_responses.append(
-                                            f"{attempt['url']}: {data}")
+                try:
+                    async with session.get(url, params=params) as response:
+                        status = response.status
 
-                                        # Check for success indicators
-                                        if (data.get('success') == 1 or
-                                            data.get('success') == True or
-                                                'cancel' in str(data).lower()):
-                                            successful_cancellation = True
-                                            break
+                        if status == 200:
+                            try:
+                                data = await response.json()
 
-                                    except:
-                                        text_data = await response.text()
-                                        api_responses.append(
-                                            f"{attempt['url']}: {text_data}")
+                                # Check for successful cancellation
+                                if data.get('success') == 1:
+                                    logger.info(
+                                        f"✅ Order {order_id} successfully cancelled via SMS Pool API")
+                                    return {
+                                        'success': True,
+                                        'message': f"Order cancelled successfully: {data.get('message', 'Order archived')}",
+                                        'api_cancelled': True,
+                                        'api_response': data
+                                    }
+                                elif data.get('success') == 0:
+                                    # API returned error - log details but still process user refund
+                                    error_messages = []
+                                    if 'errors' in data:
+                                        for error in data['errors']:
+                                            error_messages.append(
+                                                error.get('message', 'Unknown error'))
 
-                                        # Check for SMS-activate style success
-                                        if text_data.strip() == "ACCESS_CANCEL":
-                                            successful_cancellation = True
-                                            break
+                                    error_text = '; '.join(
+                                        error_messages) if error_messages else 'Unknown API error'
+                                    logger.warning(
+                                        f"⚠️ SMS Pool API cancel failed for order {order_id}: {error_text}")
+
+                                    return {
+                                        'success': True,  # Still process user refund
+                                        'message': f'API cancellation failed ({error_text}) but user refund will be processed',
+                                        'api_cancelled': False,
+                                        'api_response': data,
+                                        'note': 'User refund guaranteed despite API failure'
+                                    }
                                 else:
-                                    api_responses.append(
-                                        f"{attempt['url']}: HTTP {status}")
+                                    # Unexpected response format
+                                    logger.warning(
+                                        f"⚠️ Unexpected SMS Pool API response for order {order_id}: {data}")
+                                    return {
+                                        'success': True,  # Still process user refund
+                                        'message': 'Unexpected API response format - user refund will be processed',
+                                        'api_cancelled': False,
+                                        'api_response': data,
+                                        'note': 'User refund guaranteed despite unexpected response'
+                                    }
 
-                        else:  # POST
-                            async with session.post(attempt['url'], data=attempt['params']) as response:
-                                status = response.status
-                                if status == 200:
-                                    try:
-                                        data = await response.json()
-                                        api_responses.append(
-                                            f"{attempt['url']} (POST): {data}")
+                            except Exception as json_error:
+                                # Failed to parse JSON response
+                                text_data = await response.text()
+                                logger.warning(
+                                    f"⚠️ Failed to parse SMS Pool API response for order {order_id}: {json_error}")
+                                logger.info(f"Raw response: {text_data}")
 
-                                        if (data.get('success') == 1 or
-                                                data.get('success') == True):
-                                            successful_cancellation = True
-                                            break
-                                    except:
-                                        text_data = await response.text()
-                                        api_responses.append(
-                                            f"{attempt['url']} (POST): {text_data}")
-                                else:
-                                    api_responses.append(
-                                        f"{attempt['url']} (POST): HTTP {status}")
+                                return {
+                                    'success': True,  # Still process user refund
+                                    'message': 'API response parsing failed - user refund will be processed',
+                                    'api_cancelled': False,
+                                    'raw_response': text_data,
+                                    'note': 'User refund guaranteed despite parsing failure'
+                                }
+                        else:
+                            # Non-200 HTTP status
+                            logger.warning(
+                                f"⚠️ SMS Pool API returned HTTP {status} for order {order_id}")
+                            return {
+                                'success': True,  # Still process user refund
+                                'message': f'API returned HTTP {status} - user refund will be processed',
+                                'api_cancelled': False,
+                                'http_status': status,
+                                'note': 'User refund guaranteed despite HTTP error'
+                            }
 
-                    except Exception as e:
-                        api_responses.append(
-                            f"{attempt['url']}: Error - {str(e)}")
-                        continue
+                except Exception as request_error:
+                    logger.warning(
+                        f"⚠️ Request error during SMS Pool API cancel for order {order_id}: {request_error}")
+                    return {
+                        'success': True,  # Still process user refund
+                        'message': f'Connection error ({str(request_error)}) - user refund will be processed',
+                        'api_cancelled': False,
+                        'error': str(request_error),
+                        'note': 'User refund guaranteed despite connection error'
+                    }
 
         except Exception as e:
-            api_responses.append(f"Session error: {str(e)}")
-
-        # Log all attempts for debugging
-        logger.info(f"🔄 Cancel attempts for order {order_id}:")
-        for response in api_responses:
-            logger.info(f"  📡 {response}")
-
-        if successful_cancellation:
-            logger.info(f"✅ Order {order_id} successfully cancelled via API")
+            logger.error(
+                f"❌ Critical error during SMS Pool API cancel for order {order_id}: {str(e)}")
             return {
-                'success': True,
-                'message': 'Order cancelled successfully via SMSPool API',
-                'api_cancelled': True,
-                'api_responses': api_responses
-            }
-        else:
-            # Even if API cancel fails, we still process user refund
-            # This is common practice - user gets refunded regardless of provider API status
-            logger.warning(
-                f"⚠️ API cancel failed for order {order_id}, but user refund will be processed")
-            return {
-                'success': True,  # Still return success for user refund processing
-                'message': 'Order marked for cancellation - user refund will be processed',
+                'success': True,  # Always process user refund regardless of API issues
+                'message': f'Critical error ({str(e)}) - user refund will be processed',
                 'api_cancelled': False,
-                'api_responses': api_responses,
-                'note': 'API cancellation failed but user refund guaranteed'
+                'error': str(e),
+                'note': 'User refund guaranteed despite critical error'
             }

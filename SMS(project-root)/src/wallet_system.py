@@ -349,7 +349,23 @@ class WalletSystem:
     def process_refund(self, user_id: int, refund_amount: float, order_id: str, reason: str = "Order refund") -> bool:
         """
         Process a refund by adding amount back to wallet balance
+        INCLUDES DUPLICATE REFUND PROTECTION
         """
+        # CRITICAL SECURITY CHECK: Prevent duplicate refunds for same order
+        Transaction = Query()
+        existing_refund = self.transactions_table.search(
+            (Transaction.user_id == user_id) &
+            (Transaction.transaction_type == 'refund') &
+            (Transaction.description.matches(f'.*order {order_id}.*'))
+        )
+
+        if existing_refund:
+            logger.warning(
+                "🚨 DUPLICATE REFUND BLOCKED: Order %s already refunded for user %s",
+                order_id, user_id
+            )
+            return False
+
         return self.add_balance(
             user_id=user_id,
             amount=refund_amount,

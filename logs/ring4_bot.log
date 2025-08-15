@@ -1,0 +1,86 @@
+2025-08-14 19:25:25,869 - main - INFO - __init__:319 - 📄 Database initialized: data/ring4_database.json
+2025-08-14 19:25:25,869 - src.wallet_system - INFO - __init__:36 - 🏦 Wallet system initialized
+2025-08-14 19:25:25,869 - main - INFO - <module>:414 - ✅ Wallet system initialized successfully
+2025-08-14 19:25:25,869 - main - INFO - <module>:426 - ✅ Wallet-based system initialized
+2025-08-14 19:25:25,869 - main - ERROR - <module>:439 - ❌ SMSPOOL_API_KEY is missing or empty
+2025-08-14 19:25:25,869 - main - WARNING - <module>:440 - ⚠️ Running with limited API functionality
+2025-08-14 19:25:25,869 - main - WARNING - <module>:447 - ⚠️ Creating fallback SMSPool API instance
+2025-08-14 19:25:25,871 - asyncio - DEBUG - __init__:64 - Using selector: KqueueSelector
+2025-08-14 19:25:25,880 - asyncio - DEBUG - close:742 - Close <_UnixSelectorEventLoop running=False closed=False debug=True>
+2025-08-14 19:25:25,880 - asyncio - DEBUG - __init__:64 - Using selector: KqueueSelector
+2025-08-14 19:25:25,882 - asyncio - DEBUG - close:742 - Close <_UnixSelectorEventLoop running=False closed=False debug=True>
+2025-08-14 19:26:39,220 - main - INFO - __init__:319 - 📄 Database initialized: data/ring4_database.json
+2025-08-14 19:26:39,221 - src.wallet_system - INFO - __init__:36 - 🏦 Wallet system initialized
+2025-08-14 19:26:39,221 - main - INFO - <module>:414 - ✅ Wallet system initialized successfully
+2025-08-14 19:26:39,221 - main - INFO - <module>:426 - ✅ Wallet-based system initialized
+2025-08-14 19:26:39,221 - main - ERROR - <module>:439 - ❌ SMSPOOL_API_KEY is missing or empty
+2025-08-14 19:26:39,221 - main - WARNING - <module>:440 - ⚠️ Running with limited API functionality
+2025-08-14 19:26:39,221 - main - WARNING - <module>:447 - ⚠️ Creating fallback SMSPool API instance
+2025-08-14 19:26:39,222 - asyncio - DEBUG - __init__:64 - Using selector: KqueueSelector
+2025-08-14 19:26:39,227 - USER - INFO - poll_for_otp:470 - 🔄 Starting optimized OTP polling for order test_order (user: 123)
+2025-08-14 19:26:39,227 - PERFORMANCE - INFO - poll_for_otp:472 - ⏱️ OTP polling initiated with adaptive intervals
+2025-08-14 19:26:39,227 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #1 for order test_order (interval: 2s)
+2025-08-14 19:26:39,228 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:39,228 - API - INFO - poll_for_otp:516 - 📊 Order test_order status changed: None → success
+2025-08-14 19:26:41,231 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #2 for order test_order (interval: 2s)
+2025-08-14 19:26:41,232 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:43,234 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #3 for order test_order (interval: 2s)
+2025-08-14 19:26:43,235 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:45,237 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #4 for order test_order (interval: 2s)
+2025-08-14 19:26:45,238 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:47,240 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #5 for order test_order (interval: 2s)
+2025-08-14 19:26:47,241 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:49,243 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #6 for order test_order (interval: 2s)
+2025-08-14 19:26:49,244 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:51,247 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #7 for order test_order (interval: 2s)
+2025-08-14 19:26:51,248 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:53,250 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #8 for order test_order (interval: 2s)
+2025-08-14 19:26:53,251 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:55,254 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #9 for order test_order (interval: 2s)
+2025-08-14 19:26:55,255 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:57,257 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #10 for order test_order (interval: 2s)
+2025-08-14 19:26:57,258 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:26:59,260 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #11 for order test_order (interval: 2s)
+2025-08-14 19:26:59,261 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:01,263 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #12 for order test_order (interval: 2s)
+2025-08-14 19:27:01,264 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:03,267 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #13 for order test_order (interval: 2s)
+2025-08-14 19:27:03,268 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:05,270 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #14 for order test_order (interval: 2s)
+2025-08-14 19:27:05,271 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:07,273 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #15 for order test_order (interval: 2s)
+2025-08-14 19:27:07,273 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:09,277 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #16 for order test_order (interval: 2s)
+2025-08-14 19:27:09,278 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:11,280 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #17 for order test_order (interval: 2s)
+2025-08-14 19:27:11,281 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:13,284 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #18 for order test_order (interval: 2s)
+2025-08-14 19:27:13,285 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:15,287 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #19 for order test_order (interval: 2s)
+2025-08-14 19:27:15,288 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:17,290 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #20 for order test_order (interval: 2s)
+2025-08-14 19:27:17,291 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:19,294 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #21 for order test_order (interval: 2s)
+2025-08-14 19:27:19,295 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:21,298 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #22 for order test_order (interval: 2s)
+2025-08-14 19:27:21,299 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:23,301 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #23 for order test_order (interval: 2s)
+2025-08-14 19:27:23,302 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:25,304 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #24 for order test_order (interval: 2s)
+2025-08-14 19:27:25,305 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:27,307 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #25 for order test_order (interval: 2s)
+2025-08-14 19:27:27,307 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:29,309 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #26 for order test_order (interval: 2s)
+2025-08-14 19:27:29,310 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:31,312 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #27 for order test_order (interval: 2s)
+2025-08-14 19:27:31,313 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:33,316 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #28 for order test_order (interval: 2s)
+2025-08-14 19:27:33,317 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:35,318 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #29 for order test_order (interval: 2s)
+2025-08-14 19:27:35,319 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:37,321 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #30 for order test_order (interval: 2s)
+2025-08-14 19:27:37,322 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:39,323 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #31 for order test_order (interval: 3s)
+2025-08-14 19:27:39,324 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
+2025-08-14 19:27:42,327 - API - DEBUG - poll_for_otp:494 - 🔍 Poll #32 for order test_order (interval: 3s)
+2025-08-14 19:27:42,328 - PERFORMANCE - DEBUG - poll_for_otp:505 - ⚡ API status check completed in 0.00s
