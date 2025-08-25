@@ -16,14 +16,15 @@ class WalletSystem:
 
     Features:
     - User balance management
-    - Minimum deposit requirement ($5)
+    - Minimum deposit requirement ($1)
+    - Maximum deposit limits ($1000)
     - Automatic service deduction
     - Refund processing
     - Transaction history
     - Admin approval workflow
     """
 
-    MIN_DEPOSIT_USD = 5.00
+    MIN_DEPOSIT_USD = 1.00
     MAX_DEPOSIT_USD = 1000.00
 
     def __init__(self, database):
@@ -241,6 +242,44 @@ class WalletSystem:
             "🏦 Deposit request created for user %s: %s ($%.2f)", user_id, deposit_id, amount)
         return instructions
 
+    def create_binance_deposit_request(self, user_id: int, amount: float, binance_id: str) -> Dict[str, Any]:
+        """
+        Create a Binance deposit request that requires admin approval
+        """
+        if amount < self.MIN_DEPOSIT_USD:
+            raise ValueError(f"Minimum deposit is ${self.MIN_DEPOSIT_USD}")
+
+        if amount > self.MAX_DEPOSIT_USD:
+            raise ValueError(f"Maximum deposit is ${self.MAX_DEPOSIT_USD}")
+
+        deposit_id = f"BIN_{user_id}_{int(datetime.now().timestamp())}"
+
+        deposit_data = {
+            'deposit_id': deposit_id,
+            'user_id': user_id,
+            'amount_usd': round(amount, 2),
+            'deposit_method': 'binance',
+            'binance_id': binance_id,
+            'status': 'pending_payment',
+            'created_at': datetime.now().isoformat(),
+            # 2 hours to pay
+            'expires_at': (datetime.now() + timedelta(hours=2)).isoformat(),
+            'paid_at': None,
+            'admin_approved_at': None,
+            'admin_approved_by': None
+        }
+
+        self.deposits_table.insert(deposit_data)
+
+        logger.info(
+            "🟡 Binance deposit request created for user %s: %s ($%.2f)", user_id, deposit_id, amount)
+
+        return {
+            'deposit_id': deposit_id,
+            'amount_usd': amount,
+            'binance_id': binance_id
+        }
+
     def approve_deposit(self, deposit_id: str, admin_id: int) -> bool:
         """Approve a deposit request and add funds to user wallet"""
         try:
@@ -334,11 +373,115 @@ class WalletSystem:
             'last_activity': wallet_info.get('last_activity')
         }
 
+    def reserve_balance(self, user_id: int, amount: float, order_id: str, description: str) -> bool:
+        """
+        Reserve amount from user's wallet balance without actually deducting it
+        Returns True if successful, False if insufficient funds
+        """
+        try:
+            current_balance = self.get_user_balance(user_id)
+
+            if current_balance < amount:
+                logger.warning(
+                    "💰 Insufficient balance for reservation - user %s: $%.2f < $%.2f", user_id, current_balance, amount)
+                return False
+
+            # Record reservation transaction (but don't actually deduct yet)
+            self._record_transaction(
+                user_id=user_id,
+                transaction_type='reservation',
+                amount=amount,
+                description=f"Reserved for {description}",
+                order_id=order_id,
+                balance_after=current_balance  # Balance unchanged during reservation
+            )
+
+            logger.info(
+                "🔒 Reserved $%.2f for user %s (order: %s). Balance remains: $%.2f", amount, user_id, order_id, current_balance)
+            return True
+
+        except (ValueError, TypeError, RuntimeError) as e:
+            logger.error(
+                "❌ Error reserving balance for user %s: %s", user_id, str(e))
+            return False
+
+    def confirm_reservation(self, user_id: int, amount: float, order_id: str, description: str) -> bool:
+        """
+        Confirm a reservation by actually deducting the amount from wallet balance
+        Should only be called when OTP is successfully received
+        """
+        try:
+            current_balance = self.get_user_balance(user_id)
+
+            if current_balance < amount:
+                logger.error(
+                    "💰 CRITICAL: Insufficient balance for confirmation - user %s: $%.2f < $%.2f", user_id, current_balance, amount)
+                return False
+
+            new_balance = current_balance - amount
+
+            # Update wallet
+            User = Query()
+            self.wallets_table.update({
+                'balance': round(new_balance, 2),
+                'total_spent': self.wallets_table.search(User.user_id == user_id)[0].get('total_spent', 0) + amount,
+                'last_activity': datetime.now().isoformat()
+            }, User.user_id == user_id)
+
+            # Record final deduction transaction
+            self._record_transaction(
+                user_id=user_id,
+                transaction_type='deduction',
+                amount=amount,
+                description=f"Confirmed: {description}",
+                order_id=order_id,
+                balance_after=new_balance
+            )
+
+            logger.info(
+                "✅ Confirmed reservation $%.2f for user %s (order: %s). New balance: $%.2f", amount, user_id, order_id, new_balance)
+            return True
+
+        except (ValueError, TypeError, RuntimeError) as e:
+            logger.error(
+                "❌ Error confirming reservation for user %s: %s", user_id, str(e))
+            return False
+
+    def cancel_reservation(self, user_id: int, amount: float, order_id: str, reason: str = "Order cancelled") -> bool:
+        """
+        Cancel a reservation (no actual refund needed since money was never deducted)
+        Just record the cancellation for audit trail
+        """
+        try:
+            current_balance = self.get_user_balance(user_id)
+
+            # Record cancellation transaction
+            self._record_transaction(
+                user_id=user_id,
+                transaction_type='cancellation',
+                amount=amount,
+                description=f"Cancelled reservation: {reason}",
+                order_id=order_id,
+                balance_after=current_balance  # Balance unchanged
+            )
+
+            logger.info(
+                "🚫 Cancelled reservation $%.2f for user %s (order: %s). Balance remains: $%.2f", amount, user_id, order_id, current_balance)
+            return True
+
+        except (ValueError, TypeError, RuntimeError) as e:
+            logger.error(
+                "❌ Error cancelling reservation for user %s: %s", user_id, str(e))
+            return False
+
     def process_service_purchase(self, user_id: int, service_price: float, service_name: str, order_id: str) -> bool:
         """
+        DEPRECATED: Use reserve_balance() instead followed by confirm_reservation() when OTP received
         Process a service purchase by deducting from wallet balance
         Returns True if successful, False if insufficient funds
         """
+        logger.warning(
+            "⚠️ DEPRECATED: process_service_purchase() called. Use reserve_balance() + confirm_reservation() instead")
         return self.deduct_balance(
             user_id=user_id,
             amount=service_price,

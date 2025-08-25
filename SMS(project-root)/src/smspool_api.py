@@ -240,14 +240,14 @@ class SMSPoolAPI:
             return {
                 'success': False,
                 'balance': '0',
-                'message': 'Unable to connect to SMSPool API - please check your internet connection'
+                'message': 'Unable to connect to SMS Bot API - please check your internet connection'
             }
         except aiohttp.ServerTimeoutError:
             logger.error("❌ Timeout during balance check")
             return {
                 'success': False,
                 'balance': '0',
-                'message': 'Request timeout - SMSPool API is responding slowly'
+                'message': 'Request timeout - SMS Bot API is responding slowly'
             }
         except Exception as e:
             logger.error(f"❌ Unexpected error during balance check: {str(e)}")
@@ -493,7 +493,7 @@ class SMSPoolAPI:
         except aiohttp.ClientConnectorError as conn_error:
             logger.error(
                 f"❌ Connection error during {service_name} purchase: {conn_error}")
-            return {'success': False, 'message': f'Unable to connect to SMSPool API for {service_name}'}
+            return {'success': False, 'message': f'Unable to connect to SMS Bot API for {service_name}'}
         except aiohttp.ServerTimeoutError:
             logger.error(f"❌ Timeout during {service_name} purchase")
             return {'success': False, 'message': f'Request timeout for {service_name} - API is responding slowly'}
@@ -683,6 +683,8 @@ class SMSPoolAPI:
             service_id = service['id']
             service_name = service['name']
             service_description = service['description']
+            # Get service key for fixed pricing
+            service_key = service.get('service_key')
 
             # Check availability and pricing for the specified country
             availability = await self.check_service_availability(service_id, country_id)
@@ -690,7 +692,8 @@ class SMSPoolAPI:
             if availability.get('available'):
                 api_price = float(availability.get('price', '0'))
                 if api_price > 0:
-                    selling_price = Config.calculate_selling_price(api_price)
+                    selling_price = Config.calculate_selling_price(
+                        api_price, service_key)
                     profit = Config.get_profit_amount(api_price)
 
                     service_info = {
@@ -780,7 +783,9 @@ class SMSPoolAPI:
             if result.get('success'):
                 # Add pricing information
                 api_cost = float(result.get('cost', '0'))
-                selling_price = Config.calculate_selling_price(api_cost)
+                service_key = Config.get_service_key_by_id(service_id)
+                selling_price = Config.calculate_selling_price(
+                    api_cost, service_key)
                 profit = Config.get_profit_amount(api_cost)
 
                 result.update({
@@ -928,7 +933,7 @@ class SMSPoolAPI:
                 'success': False,
                 'status': 'network_error',
                 'sms': None,
-                'message': 'Unable to connect to SMSPool API'
+                'message': 'Unable to connect to SMS Bot API'
             }
         except aiohttp.ServerTimeoutError:
             logger.error("❌ Timeout during order status check")
@@ -955,9 +960,9 @@ class SMSPoolAPI:
         Returns: {'success': 1, 'message': 'The order has been successfully archived.'} on success
         """
 
-        # Use the correct SMS Pool cancel endpoint
+        # Use the correct SMS Pool cancel endpoint with POST method
         url = f"{self.base_url}/sms/cancel"
-        params = {'key': self.api_key, 'orderid': order_id}
+        data = {'key': self.api_key, 'orderid': order_id}
 
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -965,7 +970,7 @@ class SMSPoolAPI:
 
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 try:
-                    async with session.get(url, params=params) as response:
+                    async with session.post(url, data=data) as response:
                         status = response.status
 
                         if status == 200:
@@ -975,7 +980,7 @@ class SMSPoolAPI:
                                 # Check for successful cancellation
                                 if data.get('success') == 1:
                                     logger.info(
-                                        f"✅ Order {order_id} successfully cancelled via SMS Pool API")
+                                        f"✅ Order {order_id} successfully cancelled via SMSPool API")
                                     return {
                                         'success': True,
                                         'message': f"Order cancelled successfully: {data.get('message', 'Order archived')}",
@@ -993,7 +998,7 @@ class SMSPoolAPI:
                                     error_text = '; '.join(
                                         error_messages) if error_messages else 'Unknown API error'
                                     logger.warning(
-                                        f"⚠️ SMS Pool API cancel failed for order {order_id}: {error_text}")
+                                        f"⚠️ SMSPool API cancel failed for order {order_id}: {error_text}")
 
                                     return {
                                         'success': True,  # Still process user refund
@@ -1005,7 +1010,7 @@ class SMSPoolAPI:
                                 else:
                                     # Unexpected response format
                                     logger.warning(
-                                        f"⚠️ Unexpected SMS Pool API response for order {order_id}: {data}")
+                                        f"⚠️ Unexpected SMSPool API response for order {order_id}: {data}")
                                     return {
                                         'success': True,  # Still process user refund
                                         'message': 'Unexpected API response format - user refund will be processed',
@@ -1018,7 +1023,7 @@ class SMSPoolAPI:
                                 # Failed to parse JSON response
                                 text_data = await response.text()
                                 logger.warning(
-                                    f"⚠️ Failed to parse SMS Pool API response for order {order_id}: {json_error}")
+                                    f"⚠️ Failed to parse SMSPool API response for order {order_id}: {json_error}")
                                 logger.info(f"Raw response: {text_data}")
 
                                 return {
@@ -1031,7 +1036,7 @@ class SMSPoolAPI:
                         else:
                             # Non-200 HTTP status
                             logger.warning(
-                                f"⚠️ SMS Pool API returned HTTP {status} for order {order_id}")
+                                f"⚠️ SMSPool API returned HTTP {status} for order {order_id}")
                             return {
                                 'success': True,  # Still process user refund
                                 'message': f'API returned HTTP {status} - user refund will be processed',
@@ -1042,7 +1047,7 @@ class SMSPoolAPI:
 
                 except Exception as request_error:
                     logger.warning(
-                        f"⚠️ Request error during SMS Pool API cancel for order {order_id}: {request_error}")
+                        f"⚠️ Request error during SMSPool API cancel for order {order_id}: {request_error}")
                     return {
                         'success': True,  # Still process user refund
                         'message': f'Connection error ({str(request_error)}) - user refund will be processed',
@@ -1053,7 +1058,7 @@ class SMSPoolAPI:
 
         except Exception as e:
             logger.error(
-                f"❌ Critical error during SMS Pool API cancel for order {order_id}: {str(e)}")
+                f"❌ Critical error during SMSPool API cancel for order {order_id}: {str(e)}")
             return {
                 'success': True,  # Always process user refund regardless of API issues
                 'message': f'Critical error ({str(e)}) - user refund will be processed',

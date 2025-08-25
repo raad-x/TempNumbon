@@ -35,6 +35,9 @@ class ConfigurationManager:
         'SMSPOOL_API_KEY': '',
         'ADMIN_IDS': '',
         'BINANCE_WALLET': '',
+        'BINANCE_ID': '',
+        'CONTACT_ACCOUNT_1': '',
+        'CONTACT_ACCOUNT_2': '',
 
         # Services
         'ENABLE_RING4': True,
@@ -73,7 +76,7 @@ class ConfigurationManager:
         'WHATSAPP_PROFIT_MARGIN': '',
 
         # Wallet
-        'MIN_DEPOSIT_USD': 5.00,
+        'MIN_DEPOSIT_USD': 1.00,
         'MAX_DEPOSIT_USD': 1000.00,
         'AUTO_APPROVE_BELOW_USD': 0.00,
         'ENABLE_WALLET_SYSTEM': True,
@@ -170,14 +173,20 @@ class ConfigurationManager:
         'EXTERNAL_NOTIFICATION_URL': '',
     }
 
-    def __new__(cls):
+    def __new__(cls, config_file: Optional[str] = None):
+        # For testing purposes, allow different instances with different config files
+        if config_file:
+            instance = super().__new__(cls)
+            return instance
+
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, config_file: Optional[str] = None):
         if not hasattr(self, '_initialized'):
             self._initialized = True
+            self.config_file = config_file or 'config.env'
             self.reload_config()
 
     def reload_config(self) -> None:
@@ -186,7 +195,7 @@ class ConfigurationManager:
 
         # Load configuration files in order of priority
         config_files = [
-            'config.env',      # Primary configuration file
+            self.config_file,  # Primary configuration file (can be customized)
             '.env',            # Fallback configuration file
         ]
 
@@ -348,6 +357,16 @@ class ConfigurationManager:
         services.sort(key=lambda x: x['priority'])
         return services
 
+    def get_service_key_by_id(self, service_id: int) -> Optional[str]:
+        """Get service key by service ID"""
+        service_mappings = {
+            1574: 'ring4',
+            22: 'telegram',
+            395: 'google',
+            1012: 'whatsapp'
+        }
+        return service_mappings.get(service_id)
+
     def get_service_profit_margin(self, service_key: str) -> float:
         """Get profit margin for specific service"""
         service_margin_key = f'{service_key.upper()}_PROFIT_MARGIN'
@@ -414,6 +433,25 @@ class ConfigurationManager:
     def get_maintenance_message(self) -> str:
         """Get maintenance mode message"""
         return self.get('MAINTENANCE_MESSAGE')
+
+    def get_contact_accounts(self) -> List[str]:
+        """Get contact account usernames for customer support"""
+        accounts = []
+
+        # Get contact accounts from environment
+        account1 = self.get('CONTACT_ACCOUNT_1', '') or ''
+        account2 = self.get('CONTACT_ACCOUNT_2', '') or ''
+
+        # Strip whitespace and ensure they're strings
+        account1 = str(account1).strip() if account1 else ''
+        account2 = str(account2).strip() if account2 else ''
+
+        if account1:
+            accounts.append(account1)
+        if account2:
+            accounts.append(account2)
+
+        return accounts
 
     def validate(self) -> bool:
         """Validate configuration (legacy compatibility)"""
@@ -498,13 +536,17 @@ class LegacyConfig:
     def RING4_COUNTRY_ID(self) -> int:
         return self._config.get('DEFAULT_COUNTRY_ID')
 
-    def calculate_selling_price(self, api_price: float) -> float:
-        """Calculate selling price with profit margin (legacy method)"""
-        return self._config.calculate_selling_price(api_price)
+    def calculate_selling_price(self, api_price: float, service_key: Optional[str] = None) -> float:
+        """Calculate selling price with profit margin and service-specific pricing"""
+        return self._config.calculate_selling_price(api_price, service_key)
 
-    def get_profit_amount(self, api_price: float) -> float:
-        """Calculate profit amount for a given API price (legacy method)"""
-        return self._config.get_profit_amount(api_price)
+    def get_profit_amount(self, api_price: float, service_key: Optional[str] = None) -> float:
+        """Calculate profit amount for a given API price with service-specific pricing"""
+        return self._config.get_profit_amount(api_price, service_key)
+
+    def get_service_key_by_id(self, service_id: int) -> Optional[str]:
+        """Get service key by service ID"""
+        return self._config.get_service_key_by_id(service_id)
 
     def validate(self) -> bool:
         """Validate configuration (legacy method)"""

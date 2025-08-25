@@ -78,7 +78,7 @@ except ImportError as src_error:
             class MockWalletSystem:
                 def __init__(self, database):
                     self.db = database
-                    self.MIN_DEPOSIT_USD = 5.00
+                    self.MIN_DEPOSIT_USD = 1.00
                     self.MAX_DEPOSIT_USD = 1000.00
                     # Add mock table attributes
                     self.deposits_table = None
@@ -113,6 +113,21 @@ except ImportError as src_error:
                     _ = user_id, refund_amount, order_id, reason  # Acknowledge unused parameters
                     return False
 
+                def reserve_balance(self, user_id, amount, order_id, description):
+                    """Mock implementation - always returns False"""
+                    _ = user_id, amount, order_id, description  # Acknowledge unused parameters
+                    return False
+
+                def confirm_reservation(self, user_id, amount, order_id, description):
+                    """Mock implementation - always returns False"""
+                    _ = user_id, amount, order_id, description  # Acknowledge unused parameters
+                    return False
+
+                def cancel_reservation(self, user_id, amount, order_id, reason):
+                    """Mock implementation - always returns False"""
+                    _ = user_id, amount, order_id, reason  # Acknowledge unused parameters
+                    return False
+
                 def get_wallet_summary(self, user_id):
                     """Mock implementation - returns empty summary"""
                     _ = user_id  # Acknowledge unused parameter
@@ -136,6 +151,27 @@ except ImportError as src_error:
                             "",
                             f"⚠️ *IMPORTANT:* Send exactly ${amount:.2f}",
                             f"Include your user ID: {user_id} in transaction memo"
+                        ]
+                    }
+
+                def create_binance_deposit_request(self, user_id, amount, binance_id):
+                    """Mock implementation - returns Binance deposit request structure"""
+                    return {
+                        'deposit_id': f'BIN_{user_id}_{int(datetime.now().timestamp())}',
+                        'amount': amount,
+                        'instructions': [
+                            "*🟡 Binance Internal Transfer Request*",
+                            f"*Amount:* ${amount:.2f}",
+                            f"*Binance ID:* `{binance_id}`",
+                            "",
+                            "📋 *Instructions:*",
+                            "1. Open Binance app",
+                            "2. Go to Pay > Transfer > To Binance User",
+                            f"3. Enter Binance ID: {binance_id}",
+                            f"4. Send exactly ${amount:.2f}",
+                            f"5. Include your user ID: {user_id} in the note",
+                            "",
+                            "⚠️ *IMPORTANT:* Internal transfers are instant and free!"
                         ]
                     }
 
@@ -304,6 +340,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 # Business configuration
 BINANCE_WALLET = config_manager.get('BINANCE_WALLET')
+BINANCE_ID = config_manager.get('BINANCE_ID')
 
 # Check if bot is in maintenance mode
 if config_manager.is_maintenance_mode():
@@ -449,8 +486,23 @@ class Database:
             logger.error("❌ Error closing database: %s", e)
 
 
-# Global database instance
-db = Database()
+# Global database instance - Enhanced with Protection
+try:
+    # Import the new protected database
+    from src.protected_database import ProtectedDatabase
+
+    # Initialize with protection enabled
+    db = ProtectedDatabase(database_path=str(DB_PATH), enable_protection=True)
+    logger.info(
+        "✅ Protected Database system initialized with automated 3-day backups")
+
+except ImportError as e:
+    logger.warning(f"⚠️ Protected Database not available: {e}")
+    logger.info("🔄 Falling back to standard Database")
+
+    # Fallback to standard database
+    db = Database()
+    logger.info("📄 Standard Database initialized (protection disabled)")
 
 # Initialize wallet system
 wallet_system = None
@@ -607,18 +659,67 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                             # Update order status with OTP completion
                             db.update_order_status(
                                 order_id, 'completed', otp_code)
+
+                            # ✅ CRITICAL FIX: Only NOW charge the wallet when OTP is received!
+                            order = db.get_order(order_id)
+                            if order and wallet_system:
+                                reservation_order_id = order.get(
+                                    'reservation_order_id')
+                                service_cost = order.get('cost', 0)
+                                service_name = order.get(
+                                    'service_name', 'SMS Service')
+
+                                if reservation_order_id:
+                                    # Confirm the reservation by actually deducting from wallet
+                                    charge_success = wallet_system.confirm_reservation(
+                                        user_id=user_id,
+                                        amount=service_cost,
+                                        order_id=str(order_id),
+                                        description=f"{service_name} service - OTP received"
+                                    )
+
+                                    if charge_success:
+                                        purchase_logger.info(
+                                            "💰 WALLET CHARGED: User %s charged $%.2f for order %s (OTP received)",
+                                            user_id, service_cost, order_id)
+                                    else:
+                                        logger.error(
+                                            "❌ CRITICAL: Failed to charge user %s for completed order %s",
+                                            user_id, order_id)
+                                else:
+                                    logger.warning(
+                                        "⚠️ No reservation_order_id found for order %s - cannot charge wallet",
+                                        order_id)
+
                             user_logger.info(
-                                "✅ Order %s completed - OTP: %s", order_id, otp_code)
+                                "✅ Order %s completed - OTP: %s - WALLET CHARGED", order_id, otp_code)
                         except (OSError, RuntimeError, ValueError) as db_err:
                             logger.error(
                                 "❌ Database update failed: %s", db_err)
 
                         # Send optimized success message to user
                         # Create buttons for after OTP is received
-                        success_keyboard = [
+                        success_keyboard = []
+
+                        # Get order details for Order Again button
+                        order = db.get_order(order_id)
+
+                        # Add Order Again button if we have service details
+                        if order and order.get('service_id') and order.get('country_id'):
+                            service_name = order.get(
+                                'service_name', 'Same Service')
+                            country_flag = order.get('country_flag', '🌍')
+                            success_keyboard.append([
+                                InlineKeyboardButton(
+                                    f"� Order Again ({service_name} in {country_flag})",
+                                    callback_data=f"order_again_{order_id}"
+                                )
+                            ])
+
+                        success_keyboard.extend([
                             [
                                 InlineKeyboardButton(
-                                    "📱 Get Another", callback_data="browse_services"),
+                                    "📱 Browse Services", callback_data="browse_services"),
                                 InlineKeyboardButton(
                                     "💰 Check Wallet", callback_data="show_balance")
                             ],
@@ -628,7 +729,7 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                                 InlineKeyboardButton(
                                     "🏠 Main Menu", callback_data="back_to_start")
                             ]
-                        ]
+                        ])
                         success_reply_markup = InlineKeyboardMarkup(
                             success_keyboard)
 
@@ -664,7 +765,9 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                                 "❌ Database status update failed: %s", db_err)
 
                         # Notify user about terminal status
-                        terminal_keyboard = [
+                        terminal_keyboard = []
+
+                        terminal_keyboard.extend([
                             [
                                 InlineKeyboardButton(
                                     "↩️ Request Return", callback_data=f"refund_{order_id}"),
@@ -677,7 +780,21 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                                 InlineKeyboardButton(
                                     "🏠 Main Menu", callback_data="back_to_start")
                             ]
-                        ]
+                        ])
+
+                        # Add Order Again button at the bottom if we have service details
+                        order = db.get_order(order_id)
+                        if order and order.get('service_id') and order.get('country_id'):
+                            service_name = order.get(
+                                'service_name', 'Same Service')
+                            country_flag = order.get('country_flag', '🌍')
+                            terminal_keyboard.append([
+                                InlineKeyboardButton(
+                                    f"🔄 Order Again ({service_name} in {country_flag})",
+                                    callback_data=f"order_again_{order_id}"
+                                )
+                            ])
+
                         terminal_reply_markup = InlineKeyboardMarkup(
                             terminal_keyboard)
 
@@ -731,38 +848,49 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
             await asyncio.sleep(interval)
 
         else:
-            # TIMEOUT: No OTP received within time limit - AUTO REFUND
+            # TIMEOUT: No OTP received within time limit - CANCEL RESERVATION (no refund needed)
             try:
-                # Get order details before processing refund
+                # Get order details before processing cancellation
                 order = db.get_order(order_id)
                 if order:
-                    # Automatically process refund for timeout
+                    # Cancel reservation since no OTP was received (no actual charge occurred)
                     if wallet_system:
-                        refund_success = wallet_system.process_refund(
-                            user_id=user_id,
-                            refund_amount=order['cost'],
-                            order_id=str(order_id),
-                            reason="Automatic refund - SMS timeout"
-                        )
+                        reservation_order_id = order.get(
+                            'reservation_order_id')
+                        service_cost = order.get('cost', 0)
 
-                        if refund_success:
-                            # Update order status to refunded (not just timeout)
-                            db.update_order_status(order_id, 'refunded')
-                            # Cancel order with SMSPool if available
-                            if sms_api:
-                                try:
-                                    cancel_result = await sms_api.cancel_order(str(order_id))
-                                    if cancel_result.get('success'):
-                                        logger.info(
-                                            "✅ Timeout order %s cancelled with SMSPool", order_id)
-                                    else:
-                                        logger.warning(
-                                            "⚠️ Failed to cancel timeout order %s with SMSPool", order_id)
-                                except Exception as cancel_error:
-                                    logger.error(
-                                        "❌ Error cancelling timeout order %s: %s", order_id, cancel_error)
+                        if reservation_order_id:
+                            cancel_success = wallet_system.cancel_reservation(
+                                user_id=user_id,
+                                amount=service_cost,
+                                order_id=str(order_id),
+                                reason="SMS timeout - no OTP received"
+                            )
+
+                            if cancel_success:
+                                # Update order status to timeout (not refunded since no charge occurred)
+                                db.update_order_status(order_id, 'timeout')
+                                purchase_logger.info(
+                                    "⏰ RESERVATION CANCELLED: User %s order %s timed out - no charge occurred",
+                                    user_id, order_id)
+                                # Cancel order with SMS Bot if available
+                                if sms_api:
+                                    try:
+                                        cancel_result = await sms_api.cancel_order(str(order_id))
+                                        if cancel_result.get('success'):
+                                            logger.info(
+                                                "✅ Timeout order %s cancelled with SMS Bot", order_id)
+                                        else:
+                                            logger.warning(
+                                                "⚠️ Failed to cancel timeout order %s with SMS Bot", order_id)
+                                    except Exception as cancel_error:
+                                        logger.error(
+                                            "❌ Error cancelling timeout order %s: %s", order_id, cancel_error)
+                            else:
+                                # Fallback to timeout status if cancellation fails
+                                db.update_order_status(order_id, 'timeout')
                         else:
-                            # Fallback to timeout status if wallet refund fails
+                            # No reservation found, just mark as timeout
                             db.update_order_status(order_id, 'timeout')
                     else:
                         # No wallet system, just mark as timeout
@@ -785,7 +913,20 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
             # Create keyboard with Order Again button for timeout scenario
             timeout_keyboard = []
 
-            # Add Order Again button if we have service details
+            timeout_keyboard.extend([
+                [
+                    InlineKeyboardButton(
+                        "🔍 Explore Services", callback_data="browse_services"),
+                    InlineKeyboardButton(
+                        "� Check Balance", callback_data="show_balance")
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Main Menu", callback_data="back_to_start")
+                ]
+            ])
+
+            # Add Order Again button at the bottom if we have service details
             if order and order.get('service_id') and order.get('country_id'):
                 service_name = order.get('service_name', 'Same Service')
                 country_flag = order.get('country_flag', '🌍')
@@ -795,23 +936,10 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                         callback_data=f"order_again_{order_id}"
                     )
                 ])
-
-            timeout_keyboard.extend([
-                [
-                    InlineKeyboardButton(
-                        "🔍 Explore Services", callback_data="browse_services"),
-                    InlineKeyboardButton(
-                        "💰 Check Balance", callback_data="show_balance")
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 Main Menu", callback_data="back_to_start")
-                ]
-            ])
             timeout_reply_markup = InlineKeyboardMarkup(timeout_keyboard)
 
             total_time = (datetime.now() - start_time).total_seconds()
-            # Get updated balance after refund
+            # Get current balance (no refund needed since no charge occurred)
             user_balance = wallet_system.get_user_balance(
                 user_id) if wallet_system else 0
 
@@ -821,8 +949,8 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                 f"🆔 <b>Order:</b> #{order_id}\n"
                 f"⏱️ <b>Duration:</b> {POLL_TIMEOUT//60} minutes\n"
                 f"🔄 <b>Total Polls:</b> {poll_count}\n\n"
-                f"✅ <b>Automatic refund processed</b>\n"
-                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                f"💰 <b>Good News:</b> No charge to your wallet!\n"
+                f"💰 <b>Current Balance:</b> ${user_balance:.2f}\n\n"
                 f"You can try ordering again anytime or use 'Order Again' for the same service!",
                 parse_mode='HTML',
                 reply_markup=timeout_reply_markup
@@ -839,34 +967,44 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
         logger.error(
             "❌ Critical error in OTP polling for order %s: %s", order_id, str(e))
 
-        # Get order details and automatically process refund for error
+        # Get order details and automatically cancel reservation for error
         try:
             order = db.get_order(order_id)
             if order:
-                # Automatically process refund for error
+                # Cancel reservation since error occurred (no actual charge occurred)
                 if wallet_system:
-                    refund_success = wallet_system.process_refund(
-                        user_id=user_id,
-                        refund_amount=order['cost'],
-                        order_id=str(order_id),
-                        reason="Automatic refund - service error"
-                    )
+                    reservation_order_id = order.get('reservation_order_id')
+                    service_cost = order.get('cost', 0)
 
-                    if refund_success:
-                        # Update order status to refunded (not just error)
-                        db.update_order_status(order_id, 'refunded')
-                        # Cancel order with SMSPool if available
-                        if sms_api:
-                            try:
-                                cancel_result = await sms_api.cancel_order(str(order_id))
-                                if cancel_result.get('success'):
-                                    logger.info(
-                                        "✅ Error order %s cancelled with SMSPool", order_id)
-                            except Exception as cancel_error:
-                                logger.error(
-                                    "❌ Error cancelling error order %s: %s", order_id, cancel_error)
+                    if reservation_order_id:
+                        cancel_success = wallet_system.cancel_reservation(
+                            user_id=user_id,
+                            amount=service_cost,
+                            order_id=str(order_id),
+                            reason="Service error - cancelling reservation"
+                        )
+
+                        if cancel_success:
+                            # Update order status to error (not refunded since no charge occurred)
+                            db.update_order_status(order_id, 'error')
+                            purchase_logger.info(
+                                "❌ RESERVATION CANCELLED: User %s order %s had error - no charge occurred",
+                                user_id, order_id)
+                            # Cancel order with SMS Bot if available
+                            if sms_api:
+                                try:
+                                    cancel_result = await sms_api.cancel_order(str(order_id))
+                                    if cancel_result.get('success'):
+                                        logger.info(
+                                            "✅ Error order %s cancelled with SMS Bot", order_id)
+                                except Exception as cancel_error:
+                                    logger.error(
+                                        "❌ Error cancelling error order %s: %s", order_id, cancel_error)
+                        else:
+                            # Fallback to error status if cancellation fails
+                            db.update_order_status(order_id, 'error')
                     else:
-                        # Fallback to error status if wallet refund fails
+                        # No reservation found, just mark as error
                         db.update_order_status(order_id, 'error')
                 else:
                     # No wallet system, just mark as error
@@ -894,7 +1032,7 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
             ]
             error_reply_markup = InlineKeyboardMarkup(error_keyboard)
 
-            # Get updated balance after refund
+            # Get current balance (no refund needed since no charge occurred)
             user_balance = wallet_system.get_user_balance(
                 user_id) if wallet_system else 0
 
@@ -903,8 +1041,8 @@ async def poll_for_otp(order_id: Union[int, str], user_id: int, context: Context
                 text=f"❌ <b>Service Error</b>\n\n"
                 f"🆔 <b>Order:</b> #{order_id}\n"
                 f"🔄 <b>Polls:</b> {poll_count}\n\n"
-                f"✅ <b>Automatic refund processed</b>\n"
-                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
+                f"💰 <b>Good News:</b> No charge to your wallet!\n"
+                f"💰 <b>Current Balance:</b> ${user_balance:.2f}\n\n"
                 f"You can try ordering again anytime.",
                 parse_mode='HTML',
                 reply_markup=error_reply_markup
@@ -949,6 +1087,7 @@ async def setup_bot_menu(application: Application):
             BotCommand("orders", "📋 View order history"),
             BotCommand("refund", "↩️ Process instant returns"),
             BotCommand("help", "💬 Support & instructions"),
+            BotCommand("contact", "📞 Contact customer support"),
             BotCommand("admin", "👨‍💼 Admin panel (admin only)"),
             BotCommand("status", "🔧 Service status (admin only)"),
         ]
@@ -984,6 +1123,7 @@ async def setup_user_specific_menu(bot, user_id: int, is_admin: bool = False):
             BotCommand("orders", "📋 View order history"),
             BotCommand("refund", "↩️ Process instant returns"),
             BotCommand("help", "💬 Support & instructions"),
+            BotCommand("contact", "📞 Contact customer support"),
         ]
 
         # Add admin commands for admins
@@ -1035,10 +1175,15 @@ def get_quick_action_keyboard(user_balance: float = 0.00, is_admin: bool = False
     # Row 4: Support and utility actions
     keyboard.append([
         InlineKeyboardButton("💬 Support", callback_data="show_help"),
-        InlineKeyboardButton("🔄 Refresh", callback_data="start_menu")
+        InlineKeyboardButton("� Contact", callback_data="contact_us")
     ])
 
-    # Row 5: Admin actions (if admin)
+    # Row 5: Refresh and admin actions
+    keyboard.append([
+        InlineKeyboardButton("�🔄 Refresh", callback_data="start_menu")
+    ])
+
+    # Row 6: Admin actions (if admin)
     if is_admin:
         keyboard.append([
             InlineKeyboardButton(
@@ -1282,6 +1427,67 @@ async def handle_show_help(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_contact_us(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle contact us callback"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    # Get contact accounts from configuration
+    contact_accounts = config_manager.get_contact_accounts()
+
+    if not contact_accounts:
+        contact_text = (
+            "📞 <b>Contact Us</b>\n\n"
+            "❌ Contact information not configured.\n"
+            "Please contact an administrator for assistance."
+        )
+    else:
+        # Build contact text with available accounts
+        contact_links = []
+        for account in contact_accounts:
+            if account:  # Make sure account is not empty
+                contact_links.append(f"@{account}")
+
+        if contact_links:
+            contact_text = (
+                "📞 <b>Contact Us</b>\n\n"
+                "For enquiries, please get in touch with us through:\n\n"
+                f"{'  •  '.join(contact_links)}\n\n"
+                "💬 Feel free to reach out for:\n"
+                "• Account support\n"
+                "• Deposit assistance\n"
+                "• Technical issues\n"
+                "• General inquiries\n\n"
+                "⚡ We typically respond within a few hours!"
+            )
+        else:
+            contact_text = (
+                "📞 <b>Contact Us</b>\n\n"
+                "❌ Contact information not available.\n"
+                "Please contact an administrator for assistance."
+            )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("💬 Support", callback_data="show_help"),
+            InlineKeyboardButton(
+                "📱 Get Started", callback_data="browse_services")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Menu", callback_data="start_menu")
+        ]
+    ]
+
+    await query.edit_message_text(
+        contact_text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
 async def handle_admin_panel(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Handle admin panel callback"""
     if not update.callback_query:
@@ -1384,20 +1590,60 @@ async def handle_pending_deposits(update: Update, _context: ContextTypes.DEFAULT
         )
         return
 
-    # Get pending deposits (this would need to be implemented in wallet system)
-    pending_text = (
-        "💰 <b>Pending Deposits</b>\n\n"
-        "No pending deposits at this time.\n\n"
-        "💡 Users will see deposit instructions when they request funding."
-    )
+    # Get pending deposits from wallet system
+    pending_deposits = wallet_system.get_pending_deposits()
 
-    keyboard = [
-        [
+    if not pending_deposits:
+        pending_text = (
+            "💰 <b>Pending Deposits</b>\n\n"
+            "No pending deposits at this time.\n\n"
+            "💡 Users will see deposit instructions when they request funding."
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🔄 Refresh", callback_data="pending_deposits"),
+                InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+            ]
+        ]
+    else:
+        pending_text = "💰 <b>Pending Deposits</b>\n\n"
+        keyboard = []
+
+        for deposit in pending_deposits:
+            deposit_id = deposit['deposit_id']
+            user_id = deposit['user_id']
+            amount = deposit['amount_usd']
+            method = deposit.get('deposit_method', 'wallet')
+            created_at = datetime.fromisoformat(
+                deposit['created_at']).strftime('%Y-%m-%d %H:%M')
+
+            method_emoji = "🟡" if method == 'binance' else "💳"
+            method_text = "Binance" if method == 'binance' else "Wallet"
+
+            pending_text += (
+                f"{method_emoji} <b>${amount:.2f}</b> - {method_text}\n"
+                f"👤 User: <code>{user_id}</code>\n"
+                f"🆔 ID: <code>{deposit_id}</code>\n"
+                f"⏰ Created: {created_at}\n\n"
+            )
+
+            # Add approve/deny buttons for each deposit
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"✅ Approve ${amount:.2f}",
+                    callback_data=f"approve_deposit_{deposit_id}"),
+                InlineKeyboardButton(
+                    f"❌ Deny ${amount:.2f}",
+                    callback_data=f"deny_deposit_{deposit_id}")
+            ])
+
+        # Add refresh and back buttons at the end
+        keyboard.append([
             InlineKeyboardButton(
                 "🔄 Refresh", callback_data="pending_deposits"),
             InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-        ]
-    ]
+        ])
 
     await query.edit_message_text(
         pending_text,
@@ -1684,17 +1930,160 @@ async def handle_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /buy command (alternative to button)"""
-    await handle_browse_services(update, context)
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+    user_balance = wallet_system.get_user_balance(
+        user.id) if wallet_system else 0.00
+
+    # Show loading message
+    loading_msg = await update.message.reply_text("🔄 Loading...")
+
+    try:
+        if not sms_api:
+            await loading_msg.edit_text(
+                "❌ Service unavailable",
+                parse_mode='HTML'
+            )
+            return
+
+        # Get available services with pricing for US (country_id=1)
+        services_data = await sms_api.get_available_services_for_purchase(country_id=1)
+
+        if not services_data or not services_data.get('success'):
+            await loading_msg.edit_text(
+                "❌ Unable to load services",
+                parse_mode='HTML'
+            )
+            return
+
+        services = services_data.get('services', [])
+        if not services:
+            await loading_msg.edit_text(
+                "❌ No services available",
+                parse_mode='HTML'
+            )
+            return
+
+        # Build services menu
+        keyboard = []
+        services_text = f"� <b>US Services</b>\n\n💰 Balance: ${user_balance:.2f}\n\n"
+
+        for service in services[:6]:  # Limit to first 6 services for better UX
+            service_id = service.get('id')
+            service_name = service.get('name', f'Service {service_id}')
+            selling_price = service.get('selling_price', 0)
+            recommended = service.get('recommended', False)
+
+            if selling_price > 0:
+                emoji = "⭐" if recommended else "📱"
+
+                # Create service selection button
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{emoji} {service_name} - ${selling_price:.3f}",
+                        callback_data=f"wallet_purchase_{service_id}_{selling_price:.3f}"
+                    )
+                ])
+
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back to Menu", callback_data="start_menu")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await loading_msg.edit_text(services_text, parse_mode='HTML', reply_markup=reply_markup)
+
+    except Exception as e:
+        logger.error("Error in buy command: %s", str(e))
+        await loading_msg.edit_text(
+            "❌ Error loading services",
+            parse_mode='HTML'
+        )
 
 
 async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /services command - Browse available services"""
-    await handle_browse_services(update, context)
+    await buy_command(update, context)
 
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /orders command - View order history"""
-    await handle_my_orders(update, context)
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+
+    # Get user orders
+    orders = db.get_user_orders(user.id)
+
+    if not orders:
+        keyboard = [[
+            InlineKeyboardButton(
+                "📱 Get Number", callback_data="browse_services"),
+            InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "📋 <b>Your Orders</b>\n\n"
+            "❌ No orders found.\n\n"
+            "💡 Use /buy to get your first US phone number!",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return
+
+    # Sort orders by creation date (newest first)
+    orders.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+    # Limit to last 10 orders for better UX
+    recent_orders = orders[:10]
+
+    orders_text = "📋 <b>Recent Orders</b>\n\n"
+
+    for i, order in enumerate(recent_orders, 1):
+        status_emoji = {
+            'pending': '🟡',
+            'processing': '🔄',
+            'completed': '✅',
+            'timeout': '⏰',
+            'refunded': '💰',
+            'cancelled': '🚫',
+            'error': '❌'
+        }
+
+        emoji = status_emoji.get(order['status'], '❔')
+        created = datetime.fromisoformat(
+            order['created_at']).strftime('%m/%d %H:%M')
+
+        orders_text += (
+            f"{emoji} <b>#{order['order_id']}</b>\n"
+            f"📱 <code>{order['number']}</code>\n"
+            f"💰 ${order['cost']} • {created}\n"
+        )
+
+        if order.get('otp'):
+            orders_text += f"🔐 Code: <code>{order['otp']}</code>\n"
+
+        orders_text += f"Status: {order['status'].title()}\n\n"
+
+    if len(orders) > 10:
+        orders_text += f"... and {len(orders) - 10} more orders\n\n"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔄 Quick Return", callback_data="quick_refund"),
+            InlineKeyboardButton("📱 Get More", callback_data="browse_services")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="start_menu")
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(orders_text, parse_mode='HTML', reply_markup=reply_markup)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1766,6 +2155,62 @@ async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(help_text, parse_mode='HTML')
+
+
+async def contact_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle /contact command - Show contact information"""
+    if not update.message:
+        return
+
+    # Get contact accounts from configuration
+    contact_accounts = config_manager.get_contact_accounts()
+
+    if not contact_accounts:
+        contact_text = (
+            "📞 <b>Contact Us</b>\n\n"
+            "❌ Contact information not configured.\n"
+            "Please contact an administrator for assistance."
+        )
+    else:
+        # Build contact text with available accounts
+        contact_links = []
+        for account in contact_accounts:
+            if account:  # Make sure account is not empty
+                contact_links.append(f"@{account}")
+
+        if contact_links:
+            contact_text = (
+                "📞 <b>Contact Us</b>\n\n"
+                "For enquiries, please get in touch with us through:\n\n"
+                f"{'  •  '.join(contact_links)}\n\n"
+                "💬 Feel free to reach out for:\n"
+                "• Account support\n"
+                "• Deposit assistance\n"
+                "• Technical issues\n"
+                "• General inquiries\n\n"
+                "⚡ We typically respond within a few hours!"
+            )
+        else:
+            contact_text = (
+                "📞 <b>Contact Us</b>\n\n"
+                "❌ Contact information not available.\n"
+                "Please contact an administrator for assistance."
+            )
+
+    # Create keyboard with back button
+    keyboard = [[
+        InlineKeyboardButton("🔙 Back to Menu", callback_data="start_menu")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        contact_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    logger.info("📞 Contact command used by user %s",
+                update.effective_user.id if update.effective_user else "Unknown")
 
 
 async def refund_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -2001,25 +2446,15 @@ async def deposit_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Show deposit amount options with inline keyboard
+    # Show deposit method options with inline keyboard
     keyboard = [
         [
-            InlineKeyboardButton("💰 $5.00 (Minimum)",
-                                 callback_data="deposit_amount_5.00"),
-            InlineKeyboardButton(
-                "💰 $10.00", callback_data="deposit_amount_10.00")
+            InlineKeyboardButton("� Deposit via Wallet Address",
+                                 callback_data="deposit_method_wallet"),
         ],
         [
-            InlineKeyboardButton(
-                "💰 $25.00", callback_data="deposit_amount_25.00"),
-            InlineKeyboardButton(
-                "💰 $50.00", callback_data="deposit_amount_50.00")
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 $100.00", callback_data="deposit_amount_100.00"),
-            InlineKeyboardButton(
-                "🔢 Custom", callback_data="deposit_custom")
+            InlineKeyboardButton("� Deposit via Binance (Binance ID)",
+                                 callback_data="deposit_method_binance")
         ],
         [
             InlineKeyboardButton("💰 Check Wallet",
@@ -2030,18 +2465,13 @@ async def deposit_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     deposit_text = (
-        f"💵 <b>Add Credit to Wallet</b>\n\n"
+        f"💵 <b>Choose Deposit Method</b>\n\n"
         f"💰 <b>Current Balance:</b> ${user_balance:.2f}\n\n"
-        f"📋 <b>Choose amount:</b>\n\n"
-        f"💡 <b>Benefits</b>\n"
-        f"• Instant purchases\n"
-        f"• No payment delays\n"
-        f"• Automatic returns to wallet\n"
-        f"• Complete transaction history\n\n"
-        f"📊 <b>Amount Range</b>\n"
-        f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD:.2f}\n"
-        f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD:.2f}\n\n"
-        f"🔒 All deposits require admin verification for security"
+        f"Select your preferred deposit method:\n\n"
+        f"� <b>Wallet Address:</b> Traditional crypto transfer\n"
+        f"🟡 <b>Binance Transfer:</b> Lower fees via Binance ID\n\n"
+        f"📊 <b>Amount Range:</b> ${wallet_system.MIN_DEPOSIT_USD:.2f} - ${wallet_system.MAX_DEPOSIT_USD:.2f}\n\n"
+        f"🔒 Both methods require admin verification for security"
     )
 
     await update.message.reply_text(
@@ -2104,10 +2534,10 @@ async def approve_refund_command(update: Update, context: ContextTypes.DEFAULT_T
             cancel_result = await sms_api.cancel_order(str(order['order_id']))
             if cancel_result.get('success'):
                 logger.info(
-                    "✅ Order %s cancelled with SMSPool", order['order_id'])
+                    "✅ Order %s cancelled with SMS Bot", order['order_id'])
             else:
                 logger.warning(
-                    "⚠️ Failed to cancel order %s with SMSPool: %s", order['order_id'], cancel_result.get('message'))
+                    "⚠️ Failed to cancel order %s with SMS Bot: %s", order['order_id'], cancel_result.get('message'))
 
         # Notify the user
         try:
@@ -2232,7 +2662,7 @@ async def service_status_command(update: Update, _context: ContextTypes.DEFAULT_
 
 
 async def handle_deposit_funds(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Handle deposit funds request"""
+    """Handle deposit funds request - Show deposit method options"""
     if not update.callback_query:
         return
 
@@ -2248,25 +2678,15 @@ async def handle_deposit_funds(update: Update, _context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Wallet system not available.")
         return
 
-    # Show deposit amount options
+    # Show deposit method options
     keyboard = [
         [
-            InlineKeyboardButton("💰 $5.00 (Minimum)",
-                                 callback_data="deposit_amount_5.00"),
-            InlineKeyboardButton(
-                "💰 $10.00", callback_data="deposit_amount_10.00")
+            InlineKeyboardButton("� Deposit via Wallet Address",
+                                 callback_data="deposit_method_wallet"),
         ],
         [
-            InlineKeyboardButton(
-                "💰 $25.00", callback_data="deposit_amount_25.00"),
-            InlineKeyboardButton(
-                "💰 $50.00", callback_data="deposit_amount_50.00")
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 $100.00", callback_data="deposit_amount_100.00"),
-            InlineKeyboardButton(
-                "🔢 Custom Amount", callback_data="deposit_custom")
+            InlineKeyboardButton("� Deposit via Binance (Binance ID)",
+                                 callback_data="deposit_method_binance")
         ],
         [
             InlineKeyboardButton("🔙 Back to Balance",
@@ -2277,17 +2697,143 @@ async def handle_deposit_funds(update: Update, _context: ContextTypes.DEFAULT_TY
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     deposit_text = (
-        f"💵 <b>Add Credit to Wallet</b>\n\n"
+        f"💵 <b>Choose Deposit Method</b>\n\n"
+        f"Select your preferred deposit method:\n\n"
+        f"� <b>Wallet Address:</b> Traditional crypto transfer\n"
+        f"� <b>Binance Transfer:</b> Lower fees via Binance ID\n\n"
+        f"Both methods require admin verification for security."
+    )
+
+    await query.edit_message_text(
+        deposit_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+async def handle_deposit_method_wallet(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle wallet address deposit method selection"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    # Show deposit amount options for wallet method
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 $5.00 (Minimum)",
+                                 callback_data="deposit_wallet_5.00"),
+            InlineKeyboardButton(
+                "💰 $10.00", callback_data="deposit_wallet_10.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $25.00", callback_data="deposit_wallet_25.00"),
+            InlineKeyboardButton(
+                "💰 $50.00", callback_data="deposit_wallet_50.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $100.00", callback_data="deposit_wallet_100.00"),
+            InlineKeyboardButton(
+                "🔢 Custom", callback_data="deposit_wallet_custom")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Methods",
+                                 callback_data="deposit_funds")
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    deposit_text = (
+        f"💳 <b>Wallet Address Deposit</b>\n\n"
         f"Choose deposit amount:\n\n"
         f"💡 <b>Benefits:</b>\n"
-        f"• Instant service purchases\n"
-        f"• No payment delays\n"
+        f"• Works with any crypto wallet\n"
+        f"• Traditional transfer method\n"
         f"• Automatic refunds to wallet\n"
-        f"• Track spending history\n\n"
-        f"📋 <b>Deposit Range:</b>\n"
+        f"• Complete transaction history\n\n"
+        f"📊 <b>Amount Range</b>\n"
         f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD:.2f}\n"
         f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD:.2f}\n\n"
-        f"🏦 All deposits require admin verification"
+        f"🔒 All deposits require admin verification for security"
+    )
+
+    await query.edit_message_text(
+        deposit_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+async def handle_deposit_method_binance(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle Binance transfer deposit method selection"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    # Show deposit amount options for Binance method
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 $5.00 (Minimum)",
+                                 callback_data="deposit_binance_5.00"),
+            InlineKeyboardButton(
+                "💰 $10.00", callback_data="deposit_binance_10.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $25.00", callback_data="deposit_binance_25.00"),
+            InlineKeyboardButton(
+                "💰 $50.00", callback_data="deposit_binance_50.00")
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 $100.00", callback_data="deposit_binance_100.00"),
+            InlineKeyboardButton(
+                "🔢 Custom", callback_data="deposit_binance_custom")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Methods",
+                                 callback_data="deposit_funds")
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    deposit_text = (
+        f"🟡 <b>Binance Transfer Deposit</b>\n\n"
+        f"Choose deposit amount:\n\n"
+        f"💡 <b>Benefits:</b>\n"
+        f"• Lower transaction fees\n"
+        f"• Faster processing\n"
+        f"• Binance to Binance transfer\n"
+        f"• Complete transaction history\n\n"
+        f"📊 <b>Amount Range</b>\n"
+        f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD:.2f}\n"
+        f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD:.2f}\n\n"
+        f"🔒 All deposits require admin verification for security"
     )
 
     await query.edit_message_text(
@@ -2408,6 +2954,280 @@ async def handle_deposit_amount(update: Update, _context: ContextTypes.DEFAULT_T
         await query.edit_message_text(
             "❌ Error creating deposit request. Please try again."
         )
+
+
+async def handle_deposit_wallet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle wallet deposit amount selection"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    try:
+        # Extract amount from callback data
+        callback_data = query.data
+        if not callback_data:
+            await query.edit_message_text("❌ Invalid callback data.")
+            return
+
+        if callback_data.startswith("deposit_wallet_"):
+            amount_str = callback_data.split("_")[-1]
+            if amount_str == "custom":
+                # Redirect to dedicated custom handler
+                await handle_deposit_wallet_custom(update, context)
+                return
+
+            amount = float(amount_str)
+        else:
+            await query.edit_message_text("❌ Invalid amount selection.")
+            return
+
+        # Create deposit request for wallet method
+        deposit_request = wallet_system.create_deposit_request(
+            user_id=user.id,
+            amount=amount,
+            binance_wallet=BINANCE_WALLET
+        )
+
+        # Format deposit instructions
+        instructions_text = "💳 <b>Wallet Deposit Request</b>\n\n"
+        instructions_text += "\n".join(deposit_request['instructions'])
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "✅ Payment Sent", callback_data=f"deposit_sent_{deposit_request['deposit_id']}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_deposit")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            instructions_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+
+        logger.info("💳 Wallet deposit request created for user %s: $%s",
+                    user.id, amount)
+
+    except ValueError as e:
+        await query.edit_message_text(
+            f"❌ <b>Invalid Deposit Amount</b>\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please try again with a valid amount.",
+            parse_mode='HTML'
+        )
+    except RuntimeError as e:
+        logger.error("❌ Error creating wallet deposit request: %s", str(e))
+        await query.edit_message_text(
+            "❌ Error creating deposit request. Please try again."
+        )
+
+
+async def handle_deposit_binance_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Binance deposit amount selection"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    try:
+        # Extract amount from callback data
+        callback_data = query.data
+        if not callback_data:
+            await query.edit_message_text("❌ Invalid callback data.")
+            return
+
+        if callback_data.startswith("deposit_binance_"):
+            amount_str = callback_data.split("_")[-1]
+            if amount_str == "custom":
+                # Redirect to dedicated custom handler
+                await handle_deposit_binance_custom(update, context)
+                return
+
+            amount = float(amount_str)
+        else:
+            await query.edit_message_text("❌ Invalid amount selection.")
+            return
+
+        # Create Binance deposit request
+        if not BINANCE_ID:
+            await query.edit_message_text(
+                "❌ <b>Binance ID Not Configured</b>\n\n"
+                "Please contact administrator to set up Binance transfers.",
+                parse_mode='HTML'
+            )
+            return
+
+        # Use wallet system to create Binance deposit request
+        deposit_request = wallet_system.create_binance_deposit_request(
+            user_id=user.id,
+            amount=amount,
+            binance_id=BINANCE_ID
+        )
+
+        # Format deposit instructions
+        instructions_text = (
+            f"🟡 <b>Binance Transfer Instructions</b>\n\n"
+            f"💰 <b>Amount:</b> ${amount:.2f} USDT\n\n"
+            f"Please make the payment via Binance (Binance to Binance transfer) to minimize transaction fees.\n\n"
+            f"🆔 <b>My Binance ID:</b> <code>{BINANCE_ID}</code>\n\n"
+            f"📋 <b>Instructions:</b>\n"
+            f"1. Open Binance app/website\n"
+            f"2. Go to Pay → Transfer\n"
+            f"3. Enter Binance ID: <code>{BINANCE_ID}</code>\n"
+            f"4. Send exactly <b>${amount:.2f} USDT</b>\n"
+            f"5. Copy the Transaction ID (TXID)\n"
+            f"6. Click 'Payment Sent' below\n\n"
+            f"⚠️ <b>Important:</b>\n"
+            f"• Send exactly the specified amount\n"
+            f"• Use USDT (Tether USD)\n"
+            f"• Save your transaction receipt\n\n"
+            f"After payment, please enter your Transaction ID (TXID) or upload a screenshot.\n"
+            f"Once admin verifies, your balance will be credited.\n\n"
+            f"🆔 <b>Deposit ID:</b> <code>{deposit_request['deposit_id']}</code>"
+        )
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "✅ Payment Sent", callback_data=f"binance_sent_{deposit_request['deposit_id']}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_deposit")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            instructions_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
+        logger.info("🟡 Binance deposit request created for user %s: $%s (ID: %s)",
+                    user.id, amount, deposit_request['deposit_id'])
+
+    except ValueError as e:
+        await query.edit_message_text(
+            f"❌ <b>Invalid Deposit Amount</b>\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please try again with a valid amount.",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error("❌ Error creating Binance deposit request: %s", str(e))
+        await query.edit_message_text(
+            "❌ Error creating deposit request. Please try again."
+        )
+
+
+async def handle_deposit_wallet_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle custom wallet deposit amount request"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    # Ask user to send custom amount for wallet deposit
+    custom_text = (
+        f"💳 <b>Custom Wallet Deposit Amount</b>\n\n"
+        f"💡 Please send your desired deposit amount as a message.\n\n"
+        f"<b>Requirements:</b>\n"
+        f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD if wallet_system else 5.00}\n"
+        f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD if wallet_system else 1000.00}\n"
+        f"• Format: Enter amount only (e.g., 10.50)\n"
+        f"• No symbols ($ or USD)\n\n"
+        f"📝 <b>Example:</b> Send \"10.50\" for $10.50\n\n"
+        f"💳 <b>Payment Method:</b> Wallet Transfer\n"
+        f"🏦 <b>Wallet:</b> <code>{BINANCE_WALLET}</code>\n\n"
+        f"❌ Send /cancel to abort"
+    )
+
+    keyboard = [[
+        InlineKeyboardButton("❌ Cancel", callback_data="deposit_method_wallet")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        custom_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    # Set user state to expect custom wallet amount
+    if context.user_data is not None:
+        context.user_data['awaiting_deposit_amount'] = True
+        context.user_data['deposit_method'] = 'wallet'
+    logger.info("💳 User %s requested custom wallet deposit amount", user.id)
+
+
+async def handle_deposit_binance_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle custom Binance deposit amount request"""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    user = update.effective_user
+
+    if not query or not user:
+        return
+
+    await query.answer()
+
+    # Ask user to send custom amount for Binance deposit
+    custom_text = (
+        f"🟡 <b>Custom Binance Deposit Amount</b>\n\n"
+        f"💡 Please send your desired deposit amount as a message.\n\n"
+        f"<b>Requirements:</b>\n"
+        f"• Minimum: ${wallet_system.MIN_DEPOSIT_USD if wallet_system else 5.00}\n"
+        f"• Maximum: ${wallet_system.MAX_DEPOSIT_USD if wallet_system else 1000.00}\n"
+        f"• Format: Enter amount only (e.g., 10.50)\n"
+        f"• No symbols ($ or USD)\n\n"
+        f"📝 <b>Example:</b> Send \"10.50\" for $10.50\n\n"
+        f"🟡 <b>Payment Method:</b> Binance Transfer\n"
+        f"🆔 <b>Binance ID:</b> <code>{BINANCE_ID}</code>\n\n"
+        f"❌ Send /cancel to abort"
+    )
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "❌ Cancel", callback_data="deposit_method_binance")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        custom_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    # Set user state to expect custom Binance amount
+    if context.user_data is not None:
+        context.user_data['awaiting_deposit_amount'] = True
+        context.user_data['deposit_method'] = 'binance'
+    logger.info("🟡 User %s requested custom Binance deposit amount", user.id)
 
 
 async def handle_wallet_purchase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2573,7 +3393,7 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
                 f"⚠️ Could not get country details for ID {country_id}: {e}")
 
     try:
-        # Step 1: Deduct from wallet balance first
+        # Step 1: Reserve wallet balance (don't deduct yet - only when OTP received)
         if not wallet_system:
             await send_method(
                 "❌ Wallet system not available. Please try again later.",
@@ -2581,48 +3401,55 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        deduction_success = wallet_system.deduct_balance(
+        # Generate order ID for reservation
+        order_id = f"ORD_{user_id}_{int(datetime.now().timestamp())}"
+
+        reservation_success = wallet_system.reserve_balance(
             user_id=user_id,
             amount=selling_price,
-            description=f"{service_name} service purchase ({country_name})",
-            order_id=None  # Will update with order_id later
+            order_id=order_id,
+            description=f"{service_name} service purchase ({country_name})"
         )
 
-        if not deduction_success:
+        if not reservation_success:
+            user_balance = wallet_system.get_user_balance(user_id)
             await send_method(
-                f"❌ <b>Payment Failed</b>\n\n"
-                f"Unable to deduct ${selling_price:.2f} from your wallet.\n"
-                f"Please check your balance and try again.",
+                f"❌ <b>Insufficient Balance</b>\n\n"
+                f"💰 Service Cost: ${selling_price:.2f}\n"
+                f"💰 Your Balance: ${user_balance:.2f}\n"
+                f"💸 Need: ${selling_price - user_balance:.2f} more\n\n"
+                f"Please add funds to your wallet.",
                 parse_mode='HTML'
             )
             return
 
         # Step 2: Purchase the SMS number
         if not sms_api:
-            # Refund the balance if SMS API is not available
-            wallet_system.add_balance(
+            # Cancel the reservation if SMS API is not available
+            wallet_system.cancel_reservation(
                 user_id=user_id,
                 amount=selling_price,
-                description=f"Refund for failed {service_name} purchase - SMS API unavailable",
-                transaction_type='refund'
+                order_id=order_id,
+                reason="SMS API unavailable"
             )
             await send_method(
                 f"❌ <b>Service Unavailable</b>\n\n"
                 f"SMS service is currently unavailable.\n"
-                f"${selling_price:.2f} has been refunded to your wallet.",
+                f"No charge to your wallet.",
                 parse_mode='HTML'
             )
             return
 
-        # Show updated balance
-        new_balance = wallet_system.get_user_balance(user_id)
+        # Show processing message (no charge yet)
+        current_balance = wallet_system.get_user_balance(user_id)
         await send_method(
-            f"✅ <b>Payment Processed</b>\n\n"
-            f"💰 <b>Deducted:</b> ${selling_price:.2f}\n"
-            f"💰 <b>New Balance:</b> ${new_balance:.2f}\n"
+            f"🔄 <b>Processing {service_name} Purchase</b>\n\n"
+            f"💰 <b>Cost:</b> ${selling_price:.2f} (reserved)\n"
+            f"💰 <b>Wallet Balance:</b> ${current_balance:.2f}\n"
             f"📱 <b>Service:</b> {service_name}\n"
             f"🌍 <b>Country:</b> {country_flag} {country_name}\n\n"
-            f"🔄 Acquiring your number...",
+            f"🔄 Acquiring your number...\n\n"
+            f"💡 <b>Note:</b> You'll only be charged when you receive the OTP code!",
             parse_mode='HTML'
         )
 
@@ -2634,53 +3461,54 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
         )
 
         if not purchase_result.get('success'):
-            # Refund the balance
-            wallet_system.add_balance(
+            # Cancel the reservation
+            wallet_system.cancel_reservation(
                 user_id=user_id,
                 amount=selling_price,
-                description=f"Refund for failed {service_name} purchase - {purchase_result.get('error', 'Purchase failed')}",
-                transaction_type='refund'
+                order_id=order_id,
+                reason=f"Purchase failed - {purchase_result.get('error', 'Purchase failed')}"
             )
 
             await send_method(
                 f"❌ <b>Purchase Failed</b>\n\n"
                 f"Error: {purchase_result.get('error', 'Unknown error')}\n"
-                f"💰 ${selling_price:.2f} has been refunded to your wallet.\n\n"
+                f"💰 No charge to your wallet.\n\n"
                 f"Please try again or contact support.",
                 parse_mode='HTML'
             )
             return
 
-        # Success - create order record
-        order_id = purchase_result.get('order_id')
+        # Success - create order record (but don't charge yet)
+        actual_order_id = purchase_result.get('order_id', order_id)
         phone_number = purchase_result.get('number')
         actual_cost = purchase_result.get('cost', selling_price)
 
         # Create order in database with complete information
         order_data = {
-            'order_id': order_id,
+            'order_id': actual_order_id,
             'number': phone_number,
-            'cost': selling_price,  # What user paid from wallet
+            'cost': selling_price,  # What user will pay when OTP received
             'actual_cost': actual_cost,  # What SMS provider charged
             'service_name': service_name,
             'service_id': service_id,
             'country_id': country_id,
             'country_name': country_name,
-            'country_flag': country_flag
+            'country_flag': country_flag,
+            'reservation_order_id': order_id  # Track our reservation
         }
 
         db.create_order(user_id, order_data)
 
-        # Send success message with number
+        # Send success message with number (not charged yet)
         total_time = asyncio.get_event_loop().time() - start_time
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{order_id}"),
+                    "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{actual_order_id}"),
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Cancel Order", callback_data=f"cancel_order_{order_id}"),
+                    "❌ Cancel Order", callback_data=f"cancel_order_{actual_order_id}"),
                 InlineKeyboardButton(
                     "💰 Check Balance", callback_data="show_balance")
             ]
@@ -2691,48 +3519,49 @@ async def process_wallet_purchase(user_id: int, context: ContextTypes.DEFAULT_TY
             f"🎉 <b>{service_name} Number Acquired!</b>\n\n"
             f"📱 <b>Your Number:</b> <code>{phone_number}</code>\n"
             f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
-            f"💰 <b>Cost:</b> ${selling_price:.2f}\n"
-            f"💰 <b>Wallet Balance:</b> ${new_balance:.2f}\n"
-            f"🆔 <b>Order ID:</b> <code>{order_id}</code>\n\n"
+            f"💰 <b>Cost:</b> ${selling_price:.2f} (reserved - will charge when OTP received)\n"
+            f"💰 <b>Wallet Balance:</b> ${current_balance:.2f}\n"
+            f"🆔 <b>Order ID:</b> <code>{actual_order_id}</code>\n\n"
             f"⏰ <b>Valid for 10 minutes</b>\n"
             f"🔄 <b>OTP monitoring started</b>\n\n"
             f"⚡ <i>Acquired in {total_time:.1f} seconds</i>\n\n"
+            f"💡 <b>Payment:</b> You'll only be charged when you receive the OTP code!\n"
             f"Use this number for verification. You'll get the OTP automatically!",
             parse_mode='HTML',
             reply_markup=reply_markup
         )
 
         # Start OTP polling if order_id is valid
-        if order_id:
-            start_otp_polling(order_id, user_id, context)
+        if actual_order_id:
+            start_otp_polling(actual_order_id, user_id, context)
         else:
             logger.warning("⚠️ No order_id available for OTP polling")
 
         purchase_logger.info(
-            "✅ Wallet purchase completed for user %s: %s (%s)", user_id, order_id, country_name)
+            "✅ Number acquired for user %s: %s (%s) - Payment reserved, will charge on OTP", user_id, actual_order_id, country_name)
 
     except RuntimeError as e:
         total_time = asyncio.get_event_loop().time() - start_time
         purchase_logger.error(
             "❌ Exception during wallet purchase for user %s after %.2fs: %s", user_id, total_time, str(e))
 
-        # Try to refund if we deducted money
-        try:
-            if wallet_system:
-                wallet_system.add_balance(
+        # Try to cancel reservation if we made one
+        if 'order_id' in locals() and order_id and wallet_system:
+            try:
+                wallet_system.cancel_reservation(
                     user_id=user_id,
                     amount=selling_price,
-                    description=f"Refund for failed {service_name} purchase - Exception: {str(e)[:50]}",
-                    transaction_type='refund'
+                    order_id=order_id,
+                    reason=f"Exception during purchase: {str(e)[:50]}"
                 )
-        except RuntimeError as refund_error:
-            logger.error("❌ Failed to refund user %s: %s",
-                         user_id, refund_error)
+            except RuntimeError as cancel_error:
+                logger.error("❌ Failed to cancel reservation for user %s: %s",
+                             user_id, cancel_error)
 
         await send_method(
             f"❌ <b>Purchase Error</b>\n\n"
             f"An error occurred during purchase.\n"
-            f"💰 ${selling_price:.2f} has been refunded to your wallet.\n\n"
+            f"💰 No charge to your wallet.\n\n"
             f"Please try again or contact support if the issue persists.",
             parse_mode='HTML'
         )
@@ -2755,14 +3584,26 @@ async def handle_deposit_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.answer()
 
+    # Get deposit details to show amount to admins
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    deposit = wallet_system.get_deposit_status(deposit_id)
+    if not deposit:
+        await query.edit_message_text("❌ Deposit not found or expired.")
+        return
+
+    amount = deposit['amount_usd']
+
     # Notify all admins about deposit claim
     for admin_id in ADMIN_IDS:
         try:
             keyboard = [[
                 InlineKeyboardButton(
-                    "✅ Approve", callback_data=f"approve_deposit_{deposit_id}"),
+                    f"✅ Approve ${amount:.2f}", callback_data=f"approve_deposit_{deposit_id}"),
                 InlineKeyboardButton(
-                    "❌ Deny", callback_data=f"deny_deposit_{deposit_id}")
+                    f"❌ Deny ${amount:.2f}", callback_data=f"deny_deposit_{deposit_id}")
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2771,7 +3612,9 @@ async def handle_deposit_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text=(
                     f"💰 <b>New Deposit Claim</b>\n\n"
                     f"👤 <b>User:</b> {user.id} (@{user.username or 'Unknown'})\n"
-                    f"🆔 <b>Deposit ID:</b> <code>{deposit_id}</code>\n\n"
+                    f"💰 <b>Amount:</b> ${amount:.2f}\n"
+                    f"🆔 <b>Deposit ID:</b> <code>{deposit_id}</code>\n"
+                    f"💳 <b>Method:</b> Wallet Address\n\n"
                     f"⚠️ <b>Action Required:</b> Verify payment and approve/deny"
                 ),
                 parse_mode='HTML',
@@ -2790,6 +3633,77 @@ async def handle_deposit_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     logger.info("💰 Deposit claim submitted by user %s: %s",
+                user.id, deposit_id)
+
+
+async def handle_binance_deposit_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle when user claims Binance deposit is sent"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+
+    # Extract deposit ID from callback data: "binance_sent_BIN_123456789_1754854768"
+    if not query.data:
+        await query.answer("❌ Invalid request.")
+        return
+
+    # Get "BIN_123456789_1754854768"
+    deposit_id = "_".join(query.data.split('_')[2:])
+    user = query.from_user
+
+    await query.answer()
+
+    # Get deposit details to show amount to admins
+    if not wallet_system:
+        await query.edit_message_text("❌ Wallet system not available.")
+        return
+
+    deposit = wallet_system.get_deposit_status(deposit_id)
+    if not deposit:
+        await query.edit_message_text("❌ Deposit not found or expired.")
+        return
+
+    amount = deposit['amount_usd']
+
+    # Notify all admins about Binance deposit claim
+    for admin_id in ADMIN_IDS:
+        try:
+            keyboard = [[
+                InlineKeyboardButton(
+                    f"✅ Approve ${amount:.2f}", callback_data=f"approve_deposit_{deposit_id}"),
+                InlineKeyboardButton(
+                    f"❌ Deny ${amount:.2f}", callback_data=f"deny_deposit_{deposit_id}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"🟡 <b>New Binance Deposit Claim</b>\n\n"
+                    f"👤 <b>User:</b> {user.id} (@{user.username or 'Unknown'})\n"
+                    f"💰 <b>Amount:</b> ${amount:.2f}\n"
+                    f"🆔 <b>Deposit ID:</b> <code>{deposit_id}</code>\n"
+                    f"💳 <b>Method:</b> Binance Transfer\n"
+                    f"🆔 <b>Binance ID:</b> <code>{BINANCE_ID}</code>\n\n"
+                    f"⚠️ <b>Action Required:</b> Verify Binance payment and approve/deny\n"
+                    f"💡 <b>Note:</b> Check for transaction receipt or TXID from user"
+                ),
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+        except RuntimeError as e:
+            logger.error("Failed to notify admin %s: %s", admin_id, e)
+
+    await query.edit_message_text(
+        f"✅ <b>Binance Deposit Claim Submitted</b>\n\n"
+        f"🆔 <b>Deposit ID:</b> <code>{deposit_id}</code>\n\n"
+        f"👨‍💼 Admins have been notified and will verify your Binance payment.\n"
+        f"⏰ You'll be notified once the deposit is approved.\n\n"
+        f"💡 <b>Note:</b> Please provide Transaction ID (TXID) or screenshot if requested by admin.",
+        parse_mode='HTML'
+    )
+
+    logger.info("🟡 Binance deposit claim submitted by user %s: %s",
                 user.id, deposit_id)
 
 
@@ -3044,8 +3958,7 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
     # Show loading message
     await query.edit_message_text(
-        "🔄 <b>Loading Available Services...</b>\n\n"
-        "Checking real-time pricing and availability...",
+        "🔄 Loading services...",
         parse_mode='HTML'
     )
 
@@ -3070,49 +3983,28 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
             await query.edit_message_text(
                 "❌ <b>No Services Available</b>\n\n"
-                "All SMS services are currently unavailable. This could be due to:\n"
-                "• High demand for phone numbers\n"
-                "• Temporary API maintenance\n"
-                "• Network connectivity issues\n\n"
-                "⏰ <i>Please try refreshing in a few moments.</i>",
+                "Please try refreshing in a few moments.",
                 parse_mode='HTML',
                 reply_markup=reply_markup
             )
             return
 
-        # Build service selection menu
+        # Build service selection menu (minimal design)
         services = services_info['services']
-        message_text = "🌟 <b>Available SMS Services</b> 📱\n\n"
-        message_text += f"✅ <i>{len(services)} services currently available</i>\n\n"
+        message_text = "📱 <b>SMS Services</b>\n\n"
 
         keyboard = []
         for service in services:
             service_name = service['name']
             selling_price = service['selling_price']
 
-            # Add service info to message
-            status_icon = "⭐" if service['recommended'] else "📱"
-            message_text += f"{status_icon} <b>{service_name}</b>\n"
-            message_text += f"   💰 Price: ${selling_price:.2f}\n"
-            if service['recommended']:
-                message_text += "   🎯 <i>Recommended for best results</i>\n"
-            message_text += "\n"
-
-            # Add button for service with availability confirmation
-            button_text = f"✅ {service_name} - ${selling_price:.2f}"
-            if service['recommended']:
-                button_text = f"⭐ {service_name} - ${selling_price:.2f}"
-
+            # Simple button with just name and price
+            button_text = f"{'⭐ ' if service['recommended'] else ''}{service_name} - ${selling_price:.2f}"
             callback_data = f"select_service_{service['id']}_{selling_price}"
             keyboard.append([InlineKeyboardButton(
                 button_text, callback_data=callback_data)])
 
-        message_text += "📋 <b>Service Guide:</b>\n"
-        message_text += "• ⭐ = Recommended for best compatibility\n"
-        message_text += "• All prices include live availability check\n"
-        message_text += "• Instant purchase with wallet balance\n"
-        message_text += "• Real-time SMS delivery\n\n"
-        message_text += "🎯 <i>Choose a service to see available countries</i>"
+        message_text += "Choose a service:"
 
         # Add refresh and back buttons
         keyboard.append([
@@ -3146,9 +4038,7 @@ async def handle_browse_services(update: Update, _context: ContextTypes.DEFAULT_
 
         await query.edit_message_text(
             f"❌ <b>Error Loading Services</b>\n\n"
-            f"An error occurred while loading services:\n"
-            f"<code>{str(e)}</code>\n\n"
-            f"Please try again or contact support if the issue persists.",
+            f"Please try again.",
             parse_mode='HTML',
             reply_markup=reply_markup
         )
@@ -3873,9 +4763,7 @@ async def load_services_for_country(query, country_id: int, country_name: str, c
 
         if not services_result.get('success', False):
             await query.edit_message_text(
-                f"❌ <b>Error Loading Services</b>\n\n"
-                f"Could not load services for {country_flag} {country_name}.\n"
-                "Please try again later.",
+                f"❌ Error loading services for {country_flag} {country_name}",
                 parse_mode='HTML'
             )
             return
@@ -3891,12 +4779,7 @@ async def load_services_for_country(query, country_id: int, country_name: str, c
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await query.edit_message_text(
-                f"😔 <b>No Services Available</b>\n\n"
-                f"Unfortunately, no SMS services are currently available for {country_flag} {country_name}.\n\n"
-                f"💡 <b>Try:</b>\n"
-                f"• Checking back later\n"
-                f"• Selecting a different country\n"
-                f"• Contacting support if you need this country urgently",
+                f"❌ No services for {country_flag} {country_name}",
                 parse_mode='HTML',
                 reply_markup=reply_markup
             )
@@ -3906,10 +4789,7 @@ async def load_services_for_country(query, country_id: int, country_name: str, c
         keyboard = []
 
         # Add title row
-        service_text = (
-            f"📱 <b>Services for {country_flag} {country_name}</b>\n\n"
-            f"✅ <b>{len(services)} services available</b>\n\n"
-        )
+        service_text = f"📱 <b>{country_flag} {country_name}</b>\n\n"
 
         # Add each service as a button
         for service in services:
@@ -3923,11 +4803,6 @@ async def load_services_for_country(query, country_id: int, country_name: str, c
             keyboard.append([
                 InlineKeyboardButton(button_text, callback_data=callback_data)
             ])
-
-            # Add service info to text
-            service_text += f"{'⭐ ' if recommended else '•'} <b>{service_name}</b> - ${selling_price:.2f}\n"
-
-        service_text += f"\n💡 <b>Tip:</b> ⭐ indicates recommended service"
 
         # Add navigation buttons
         keyboard.append([
@@ -3950,8 +4825,7 @@ async def load_services_for_country(query, country_id: int, country_name: str, c
     except Exception as e:
         logger.error(f"❌ Error loading services for {country_name}: {e}")
         await query.edit_message_text(
-            f"❌ <b>Error Loading Services</b>\n\n"
-            f"Could not load services for {country_flag} {country_name}.\n"
+            f"❌ Error loading services for {country_flag} {country_name}",
             f"Error: {str(e)}\n\n"
             "Please try again later.",
             parse_mode='HTML'
@@ -4709,7 +5583,7 @@ async def handle_service_unavailable(user_id: int, payment_id: Optional[str], co
         f"💰 <b>Payment ID:</b> <code>{payment_id or 'N/A'}</code>\n"
         f"⚠️ <b>Issue:</b> {reason}\n\n"
         f"🔧 <b>Action Required:</b>\n"
-        f"• Check SMSPool balance\n"
+        f"• Check SMS Bot balance\n"
         f"• Top up account if needed\n"
         f"• Monitor service status\n"
         f"• Process refund if needed\n\n"
@@ -4753,21 +5627,21 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
     order_id = None
 
     try:
-        # Step 1: Deduct from wallet balance first
+        # Step 1: Reserve wallet balance (don't deduct yet - only when OTP received)
         if not wallet_system:
             await send_method("❌ Wallet system unavailable. Contact administrator.", parse_mode='HTML')
             return
 
-        # Attempt to deduct balance
+        # Attempt to reserve balance
         order_id = f"ORD_{user_id}_{int(datetime.now().timestamp())}"
-        deduction_success = wallet_system.process_service_purchase(
+        reservation_success = wallet_system.reserve_balance(
             user_id=user_id,
-            service_price=selling_price,
-            service_name=service_name,
-            order_id=order_id
+            amount=selling_price,
+            order_id=order_id,
+            description=f"{service_name} service purchase"
         )
 
-        if not deduction_success:
+        if not reservation_success:
             user_balance = wallet_system.get_user_balance(user_id)
             await send_method(
                 f"❌ <b>Insufficient Balance</b>\n\n"
@@ -4780,51 +5654,54 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
             return
 
         purchase_logger.info(
-            "✅ Wallet balance deducted for user %s: $%.2f", user_id, selling_price)
+            "🔒 Wallet balance reserved for user %s: $%.2f (order: %s)", user_id, selling_price, order_id)
 
         # Step 2: Show processing message
+        current_balance = wallet_system.get_user_balance(user_id)
         await send_method(
             f"⚡ <b>Processing {service_name} Purchase</b>\n\n"
-            f"💰 Cost: ${selling_price:.2f} (deducted from wallet)\n"
+            f"💰 Cost: ${selling_price:.2f} (reserved - will charge when OTP received)\n"
+            f"💰 Current Balance: ${current_balance:.2f}\n"
             f"📱 Service: {service_name}\n"
-            f"🔄 Acquiring your number...",
+            f"🔄 Acquiring your number...\n\n"
+            f"💡 <b>Note:</b> You'll only be charged when you receive the OTP code!",
             parse_mode='HTML'
         )
 
         if not sms_api:
-            # Refund to wallet and show error
-            wallet_system.process_refund(
+            # Cancel reservation and show error
+            wallet_system.cancel_reservation(
                 user_id, selling_price, order_id, "SMS API unavailable")
-            await send_method("❌ SMS service unavailable. Amount refunded to wallet.", parse_mode='HTML')
+            await send_method("❌ SMS service unavailable. No charge to your wallet.", parse_mode='HTML')
             return
 
         # Step 3: Validate API balance
         try:
             balance_result = await sms_api.check_balance()
         except (AttributeError, RuntimeError):
-            # Refund to wallet
-            wallet_system.process_refund(
+            # Cancel reservation
+            wallet_system.cancel_reservation(
                 user_id, selling_price, order_id, "Provider balance check failed")
-            await send_method("❌ Service provider unavailable. Amount refunded to wallet.", parse_mode='HTML')
+            await send_method("❌ Service provider unavailable. No charge to your wallet.", parse_mode='HTML')
             return
 
         if isinstance(balance_result, Exception) or not balance_result.get('success'):
-            # Refund to wallet
-            wallet_system.process_refund(
+            # Cancel reservation
+            wallet_system.cancel_reservation(
                 user_id, selling_price, order_id, "Provider balance check failed")
-            await send_method("❌ Service provider unavailable. Amount refunded to wallet.", parse_mode='HTML')
+            await send_method("❌ Service provider unavailable. No charge to your wallet.", parse_mode='HTML')
             return
 
         current_balance = float(balance_result.get('balance', '0.0'))
         estimated_cost = selling_price * 0.8  # 80% safety margin
 
         if current_balance < estimated_cost:
-            # Refund to wallet
-            wallet_system.process_refund(
+            # Cancel reservation
+            wallet_system.cancel_reservation(
                 user_id, selling_price, order_id, "Provider insufficient balance")
             await send_method(
                 f"❌ Service temporarily unavailable (provider balance: ${current_balance:.2f}). "
-                f"Amount refunded to wallet.",
+                f"No charge to your wallet.",
                 parse_mode='HTML'
             )
             return
@@ -4835,9 +5712,10 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
 
         await send_method(
             f"🔄 <b>Acquiring {service_name} Number...</b>\n\n"
-            f"💰 Payment: ${selling_price:.2f} (processed)\n"
+            f"💰 Payment: ${selling_price:.2f} (reserved)\n"
             f"📞 Requesting number from provider...\n"
-            f"⏱️ This may take a few seconds...",
+            f"⏱️ This may take a few seconds...\n\n"
+            f"💡 <b>Remember:</b> Payment only processed when OTP is received!",
             parse_mode='HTML'
         )
 
@@ -4852,40 +5730,41 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
             purchase_logger.info(
                 "✅ %s number acquired successfully for user %s", service_name, user_id)
 
-            # Create order record
+            # Create order record (don't charge yet)
+            actual_order_id = result.get('order_id', order_id)
             order_data = {
                 'user_id': user_id,
                 'service_id': service_id,
                 'service_name': service_name,
                 'number': result['number'],
-                'order_id': result.get('order_id', order_id),
+                'order_id': actual_order_id,
                 'cost': selling_price,
                 'status': 'pending',
                 'created_at': datetime.now().isoformat(),
                 'expires_at': (datetime.now() + timedelta(seconds=ORDER_EXPIRES_IN)).isoformat(),
                 'country_id': 1,  # Default to US for legacy function
                 'country_name': 'United States',
-                'country_flag': '🇺🇸'
+                'country_flag': '🇺🇸',
+                'reservation_order_id': order_id  # Track our reservation
             }
 
             db_order_id = db.create_order(user_id, order_data)
 
             # Update with actual order ID
             if 'order_id' in result:
-                order_id = result['order_id']
                 db.update_order_status(db_order_id, 'pending')
 
             # Create cancel/refund buttons for the order
             keyboard = [
                 [
                     InlineKeyboardButton(
-                        "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{order_id}"),
+                        "🔄 Get Different Number", callback_data=f"instant_refund_reorder_{actual_order_id}"),
                 ],
                 [
                     InlineKeyboardButton(
-                        "🚫 Cancel Order", callback_data=f"cancel_order_{order_id}"),
+                        "🚫 Cancel Order", callback_data=f"cancel_order_{actual_order_id}"),
                     InlineKeyboardButton(
-                        "💰 Request Refund", callback_data=f"refund_{order_id}")
+                        "💰 Request Refund", callback_data=f"refund_{actual_order_id}")
                 ],
                 [
                     InlineKeyboardButton(
@@ -4896,46 +5775,47 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # Success message with action buttons
+            # Success message with action buttons (not charged yet)
             await send_method(
                 f"✅ <b>{service_name} Number Acquired!</b>\n\n"
                 f"📱 <b>Your Number:</b> <code>{result['number']}</code>\n"
-                f"💰 <b>Cost:</b> ${selling_price:.2f}\n"
-                f"🆔 <b>Order ID:</b> <code>{order_id}</code>\n"
+                f"💰 <b>Cost:</b> ${selling_price:.2f} (reserved - will charge when OTP received)\n"
+                f"💰 <b>Wallet Balance:</b> ${current_balance:.2f}\n"
+                f"🆔 <b>Order ID:</b> <code>{actual_order_id}</code>\n"
                 f"⏰ <b>Valid for:</b> 10 minutes\n\n"
                 f"🔔 <b>Waiting for SMS...</b>\n"
                 f"OTP will be delivered automatically when received.\n\n"
-                f"💡 <b>Need help?</b> Use the buttons below for order management.",
+                f"💡 <b>Payment:</b> You'll only be charged when you receive the OTP code!\n"
+                f"Use the buttons below for order management.",
                 parse_mode='HTML',
                 reply_markup=reply_markup
             )
 
             # Start OTP polling
-            start_otp_polling(order_id, user_id, context)
+            start_otp_polling(actual_order_id, user_id, context)
 
-            user_balance_after = wallet_system.get_user_balance(user_id)
             purchase_logger.info(
-                "🎉 Purchase completed for user %s: %s | Order: %s | Balance: $%.2f",
-                user_id, service_name, order_id, user_balance_after
+                "🎉 Number acquisition completed for user %s: %s | Order: %s | Payment reserved",
+                user_id, service_name, actual_order_id
             )
 
         else:
-            # Purchase failed - refund to wallet
+            # Purchase failed - cancel reservation
             error_msg = result.get('message', 'Unknown error')
             purchase_logger.error(
                 "❌ %s purchase failed for user %s: %s", service_name, user_id, error_msg)
 
-            # Process refund
-            refund_success = wallet_system.process_refund(
+            # Cancel reservation
+            cancel_success = wallet_system.cancel_reservation(
                 user_id, selling_price, order_id, f"Purchase failed: {error_msg}")
 
-            refund_text = " Amount refunded to wallet." if refund_success else " Please contact support for refund."
+            cancel_text = " No charge to your wallet." if cancel_success else " Please contact support."
 
             await send_method(
                 f"❌ <b>Purchase Failed</b>\n\n"
                 f"Service: {service_name}\n"
                 f"Error: {error_msg}\n"
-                f"💰 ${selling_price:.2f}{refund_text}",
+                f"💰 ${selling_price:.2f}{cancel_text}",
                 parse_mode='HTML'
             )
 
@@ -4943,20 +5823,20 @@ async def process_wallet_service_purchase(user_id: int, context: ContextTypes.DE
         purchase_logger.error(
             "❌ Critical error in wallet purchase for user %s: %s", user_id, str(e))
 
-        # Attempt refund on any error
-        if order_id and wallet_system:
+        # Attempt to cancel reservation on any error
+        if 'order_id' in locals() and order_id and wallet_system:
             try:
-                wallet_system.process_refund(
+                wallet_system.cancel_reservation(
                     user_id, selling_price, order_id, f"System error: {str(e)}")
-                refund_text = " Amount refunded to wallet."
-            except OSError:
-                refund_text = " Please contact support for refund."
+                cancel_text = " No charge to your wallet."
+            except (OSError, RuntimeError):
+                cancel_text = " Please contact support."
         else:
-            refund_text = ""
+            cancel_text = ""
 
         await send_method(
             f"❌ <b>System Error</b>\n\n"
-            f"An error occurred during purchase.{refund_text}\n"
+            f"An error occurred during purchase.{cancel_text}\n"
             f"Please try again or contact support.",
             parse_mode='HTML'
         )
@@ -5032,16 +5912,16 @@ async def handle_refund_request(update: Update, context: ContextTypes.DEFAULT_TY
                 # Update order status to refunded
                 db.update_order_status(order_id, 'refunded')
 
-                # Cancel order with SMSPool if available
+                # Cancel order with SMS Bot if available
                 if sms_api:
                     try:
                         cancel_result = await sms_api.cancel_order(str(order_id))
                         if cancel_result.get('success'):
                             logger.info(
-                                "✅ User refund order %s cancelled with SMSPool", order_id)
+                                "✅ User refund order %s cancelled with SMS Bot", order_id)
                         else:
                             logger.warning(
-                                "⚠️ Failed to cancel user refund order %s with SMSPool", order_id)
+                                "⚠️ Failed to cancel user refund order %s with SMS Bot", order_id)
                     except Exception as cancel_error:
                         logger.error(
                             "❌ Error cancelling user refund order %s: %s", order_id, cancel_error)
@@ -5218,14 +6098,14 @@ async def handle_instant_refund_and_reorder(update: Update, context: ContextType
             try:
                 cancel_result = await sms_api.cancel_order(str(order_id))
 
-                # Our fixed SMS Pool API now returns reliable results
+                # Our fixed SMS Bot API now returns reliable results
                 if cancel_result.get('success', False):
                     api_refund_success = True
                     logger.info(
-                        "✅ Order %s successfully cancelled with SMS Pool API for instant reorder", order_id)
+                        "✅ Order %s successfully cancelled with SMS Bot API for instant reorder", order_id)
                 else:
                     logger.warning(
-                        "⚠️ SMS Pool API did not confirm cancellation for order %s: %s",
+                        "⚠️ SMS Bot API did not confirm cancellation for order %s: %s",
                         order_id, cancel_result.get('message', 'Unknown error'))
             except Exception as cancel_error:
                 logger.warning(
@@ -5271,49 +6151,90 @@ async def handle_instant_refund_and_reorder(update: Update, context: ContextType
                 parse_mode='HTML'
             )
 
-            # Process refund based on API cancellation result
-            refund_success = False
+            # Process original order cancellation based on API result and reservation system
+            cancel_success = False
+
+            # Get the original order to check if it has a reservation
+            original_order = db.get_order(order_id)
+            reservation_order_id = original_order.get(
+                'reservation_order_id') if original_order else None
+
             if api_refund_success:
-                # API successfully cancelled and refunded - no wallet refund needed
-                logger.info(
-                    f"✅ Order {order_id} refunded by SMS Pool API - no wallet refund needed")
-                refund_success = True
+                # API successfully cancelled - just cancel the reservation (no wallet refund needed)
+                if reservation_order_id:
+                    cancel_success = wallet_system.cancel_reservation(
+                        user_id=user_id,
+                        amount=order_cost,
+                        order_id=str(order_id),
+                        reason="Instant replacement - API cancelled original order"
+                    )
+                    logger.info(
+                        f"✅ Order {order_id} cancelled by SMS Bot API - reservation cancelled")
+                else:
+                    # Old order without reservation - already charged, no action needed
+                    cancel_success = True
+                    logger.info(
+                        f"✅ Order {order_id} refunded by SMS Bot API - no wallet action needed")
             else:
-                # API refund failed or unconfirmed - process wallet refund to protect user
-                logger.warning(
-                    f"⚠️ SMS Pool API refund failed for order {order_id} - processing wallet refund")
-                refund_success = wallet_system.process_refund(
-                    user_id=user_id,
-                    refund_amount=order_cost,
-                    order_id=str(order_id),
-                    reason="Instant number replacement - wallet refund (API refund failed)"
-                )
+                # API refund failed or unconfirmed
+                if reservation_order_id:
+                    # Cancel the reservation since no actual charge occurred
+                    cancel_success = wallet_system.cancel_reservation(
+                        user_id=user_id,
+                        amount=order_cost,
+                        order_id=str(order_id),
+                        reason="Instant replacement - API refund failed, cancelling reservation"
+                    )
+                    logger.info(
+                        f"⚠️ API refund failed for order {order_id} - cancelled reservation (no charge occurred)")
+                else:
+                    # Old order without reservation - may need actual refund
+                    cancel_success = wallet_system.process_refund(
+                        user_id=user_id,
+                        refund_amount=order_cost,
+                        order_id=str(order_id),
+                        reason="Instant replacement - legacy order refund"
+                    )
+                    logger.warning(
+                        f"⚠️ SMS Bot API refund failed for legacy order {order_id} - processed wallet refund")
 
-            if not refund_success:
-                # This is a critical error - we have two orders now
+            if not cancel_success:
+                # This is a critical error - we have two reservations/orders now
                 logger.error(
-                    "🚨 CRITICAL: Refund failed after new order placed - user %s has double charge", user_id)
+                    "🚨 CRITICAL: Failed to handle original order %s after new order %s placed", order_id, new_order_id)
 
-                # Try to cancel the new order to avoid double charging
+                # Try to cancel the new order to avoid double reservation
                 try:
                     await sms_api.cancel_order(str(new_order_id))
+                    # Also cancel the new order's reservation
+                    wallet_system.cancel_reservation(
+                        user_id=user_id,
+                        amount=order_cost,
+                        order_id=str(new_order_id),
+                        reason="Cancelling new order due to original order handling failure"
+                    )
                 except:
                     pass
 
                 await query.edit_message_text(
                     f"❌ <b>Critical Error</b>\n\n"
-                    f"Failed to process refund for order #{order_id}.\n"
+                    f"Failed to process original order #{order_id}.\n"
                     f"New order #{new_order_id} has been cancelled.\n\n"
                     f"Please contact support immediately.\n"
-                    f"Reference: Refund processing error",
+                    f"Reference: Order handling error",
                     parse_mode='HTML'
                 )
                 return
 
-            # Update original order status
-            db.update_order_status(order_id, 'refunded')
+            # Update original order status based on what happened
+            if api_refund_success or reservation_order_id:
+                # Cancelled, not refunded (no charge occurred)
+                db.update_order_status(order_id, 'cancelled')
+            else:
+                # Actually refunded (legacy order)
+                db.update_order_status(order_id, 'refunded')
 
-            # Create new order in database
+            # Create new order in database with reservation system
             new_order_data = {
                 'order_id': new_order_id,
                 'number': new_phone_number,
@@ -5322,18 +6243,36 @@ async def handle_instant_refund_and_reorder(update: Update, context: ContextType
                 'service_id': service_id,
                 'country_id': country_id,
                 'country_name': country_name,
-                'country_flag': country_flag
+                'country_flag': country_flag,
+                # New reservation for new order
+                'reservation_order_id': f"ORD_{user_id}_{int(datetime.now().timestamp())}"
             }
 
             db.create_order(user_id, new_order_data)
 
-            # Deduct balance for new order
-            wallet_system.deduct_balance(
+            # Reserve balance for new order (will charge when OTP received)
+            reservation_success = wallet_system.reserve_balance(
                 user_id=user_id,
                 amount=order_cost,
-                description=f"Instant number replacement - {service_name} ({country_name})",
-                order_id=str(new_order_id)
+                order_id=str(new_order_id),
+                description=f"Instant number replacement - {service_name} ({country_name})"
             )
+
+            if not reservation_success:
+                # Critical error - cancel the new order and notify user
+                try:
+                    await sms_api.cancel_order(str(new_order_id))
+                except:
+                    pass
+
+                await query.edit_message_text(
+                    f"❌ <b>Insufficient Balance for Replacement</b>\n\n"
+                    f"New order #{new_order_id} has been cancelled.\n"
+                    f"Original order #{order_id} remains active.\n\n"
+                    f"Please add funds to your wallet and try again.",
+                    parse_mode='HTML'
+                )
+                return
 
             # Get updated balance
             user_balance = wallet_system.get_user_balance(user_id)
@@ -5353,24 +6292,27 @@ async def handle_instant_refund_and_reorder(update: Update, context: ContextType
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # Send success message with new number and refund status
+            # Send success message with new number and status
             refund_status_msg = ""
             if api_refund_success:
-                refund_status_msg = "✅ <b>SMS Pool Refund:</b> Confirmed\n"
+                refund_status_msg = "✅ <b>SMS Bot:</b> Original order cancelled by API\n"
+            elif reservation_order_id:
+                refund_status_msg = "✅ <b>Wallet:</b> Original order reservation cancelled (no charge occurred)\n"
             else:
-                refund_status_msg = "💰 <b>Wallet Refund:</b> Processed\n"
+                refund_status_msg = "💰 <b>Wallet:</b> Original order refunded (legacy order)\n"
 
             await query.edit_message_text(
                 f"🎉 <b>Number Successfully Replaced!</b>\n\n"
                 f"📱 <b>Your New Number:</b> <code>{new_phone_number}</code>\n"
                 f"🌍 <b>Country:</b> {country_flag} {country_name}\n"
                 f"📱 <b>Service:</b> {service_name}\n"
-                f"💰 <b>Cost:</b> ${order_cost:.2f}\n"
+                f"💰 <b>Cost:</b> ${order_cost:.2f} (reserved - will charge when OTP received)\n"
                 f"💰 <b>Wallet Balance:</b> ${user_balance:.2f}\n"
                 f"🆔 <b>New Order ID:</b> <code>{new_order_id}</code>\n\n"
                 f"⏰ <b>Valid for 10 minutes</b>\n"
                 f"🔄 <b>OTP monitoring started</b>\n\n"
                 f"✨ <b>Replaced order #{order_id}</b>\n"
+                f"💡 <b>Payment:</b> You'll only be charged when you receive the OTP code!\n"
                 f"{refund_status_msg}"
                 f"Use this number for verification. You'll get the OTP automatically!",
                 parse_mode='HTML',
@@ -5492,17 +6434,17 @@ async def handle_refund_and_reorder(update: Update, context: ContextTypes.DEFAUL
 
         if sms_api:
             try:
-                # Cancel the order using our fixed SMS Pool API
+                # Cancel the order using our fixed SMS Bot API
                 cancel_result = await sms_api.cancel_order(str(order_id))
 
-                # Our fixed SMS Pool API now returns reliable results
+                # Our fixed SMS Bot API now returns reliable results
                 if cancel_result.get('success', False):
                     api_refund_success = True
                     logger.info(
-                        "✅ Order %s successfully cancelled with SMS Pool API for reorder", order_id)
+                        "✅ Order %s successfully cancelled with SMS Bot API for reorder", order_id)
                 else:
                     logger.warning(
-                        "⚠️ SMS Pool API did not confirm cancellation for order %s: %s",
+                        "⚠️ SMS Bot API did not confirm cancellation for order %s: %s",
                         order_id, cancel_result.get('message', 'Unknown error'))
             except Exception as cancel_error:
                 logger.warning(
@@ -5513,12 +6455,12 @@ async def handle_refund_and_reorder(update: Update, context: ContextTypes.DEFAUL
         if api_refund_success:
             # API successfully cancelled and refunded - no wallet refund needed
             logger.info(
-                f"✅ Order {order_id} refunded by SMS Pool API - no wallet refund needed")
+                f"✅ Order {order_id} refunded by SMS Bot API - no wallet refund needed")
             refund_success = True
         else:
             # API refund failed - process wallet refund to protect user
             logger.warning(
-                f"⚠️ SMS Pool API refund failed for order {order_id} - processing wallet refund")
+                f"⚠️ SMS Bot API refund failed for order {order_id} - processing wallet refund")
             refund_success = wallet_system.process_refund(
                 user_id=user_id,
                 refund_amount=order_cost,
@@ -5541,7 +6483,7 @@ async def handle_refund_and_reorder(update: Update, context: ContextTypes.DEFAUL
         # Step 4: Show reorder progress with refund status
         refund_status_msg = ""
         if api_refund_success:
-            refund_status_msg = "✅ <b>SMS Pool Refund:</b> Confirmed\n"
+            refund_status_msg = "✅ <b>SMS Bot Refund:</b> Confirmed\n"
         else:
             refund_status_msg = "💰 <b>Wallet Refund:</b> Processed\n"
 
@@ -5737,17 +6679,6 @@ def create_order_again_keyboard(order_id, order):
     """Create keyboard with Order Again button if service details are available"""
     keyboard = []
 
-    # Only show Order Again if we have service details
-    if order.get('service_id') and order.get('country_id'):
-        service_name = order.get('service_name', 'Same Service')
-        country_flag = order.get('country_flag', '🌍')
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🔄 Order Again ({service_name} in {country_flag})",
-                callback_data=f"order_again_{order_id}"
-            )
-        ])
-
     keyboard.extend([
         [
             InlineKeyboardButton("📱 Browse Services",
@@ -5758,6 +6689,17 @@ def create_order_again_keyboard(order_id, order):
             InlineKeyboardButton("🔙 Main Menu", callback_data="start_menu")
         ]
     ])
+
+    # Add Order Again button at the bottom if we have service details
+    if order.get('service_id') and order.get('country_id'):
+        service_name = order.get('service_name', 'Same Service')
+        country_flag = order.get('country_flag', '🌍')
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🔄 Order Again ({service_name} in {country_flag})",
+                callback_data=f"order_again_{order_id}"
+            )
+        ])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -5918,7 +6860,7 @@ async def process_refund_approval(update: Update, context: ContextTypes.DEFAULT_
                     )
                     return
 
-            # Cancel order with SMSPool if sms_api is available
+            # Cancel order with SMS Bot if sms_api is available
             if sms_api:
                 cancel_result = await sms_api.cancel_order(str(order_id))
 
@@ -6163,18 +7105,44 @@ async def process_order_cancellation(user_id: int, order_id: str, order: Dict, q
                     "❌ Error cancelling order %s via API: %s", order_id, api_error)
                 api_message = f"API error: {str(api_error)}"
 
-        # Process refund via wallet system
-        refund_success = False
+        # Process reservation cancellation via wallet system (no refund needed since no charge occurred)
+        cancel_success = False
         if wallet_system:
-            refund_success = wallet_system.process_refund(
-                user_id=user_id,
-                refund_amount=order['cost'],
-                order_id=str(order_id),
-                reason="User cancelled order - auto refund"
-            )
+            reservation_order_id = order.get('reservation_order_id')
+            service_cost = order.get('cost', 0)
+
+            if reservation_order_id:
+                # Cancel the reservation since order is being cancelled
+                cancel_success = wallet_system.cancel_reservation(
+                    user_id=user_id,
+                    amount=service_cost,
+                    order_id=str(order_id),
+                    reason="User cancelled order"
+                )
+
+                if cancel_success:
+                    logger.info(
+                        "🚫 RESERVATION CANCELLED: User %s cancelled order %s - no charge occurred",
+                        user_id, order_id)
+                else:
+                    logger.warning(
+                        "⚠️ Failed to cancel reservation for order %s - continuing with cancellation",
+                        order_id)
+            else:
+                # No reservation found, may be old order - try to refund if already charged
+                refund_success = wallet_system.process_refund(
+                    user_id=user_id,
+                    refund_amount=order['cost'],
+                    order_id=str(order_id),
+                    reason="User cancelled order - legacy refund"
+                )
+                cancel_success = refund_success
+                if refund_success:
+                    logger.info(
+                        "💰 LEGACY REFUND: Processed refund for old order %s", order_id)
 
         # Update order status
-        if refund_success:
+        if cancel_success or not wallet_system:
             db.update_order_status(order_id, 'cancelled')
             user_balance = wallet_system.get_user_balance(
                 user_id) if wallet_system else 0.00
@@ -6182,9 +7150,9 @@ async def process_order_cancellation(user_id: int, order_id: str, order: Dict, q
             await query.edit_message_text(
                 f"✅ <b>Order Cancelled Successfully</b>\n\n"
                 f"🆔 <b>Order ID:</b> #{order_id}\n"
-                f"💰 <b>Refund Amount:</b> ${order['cost']}\n"
-                f"💰 <b>New Balance:</b> ${user_balance:.2f}\n\n"
-                f"✅ Your order has been cancelled and refund processed automatically.\n"
+                f"💰 <b>Good News:</b> No charge to your wallet!\n"
+                f"💰 <b>Current Balance:</b> ${user_balance:.2f}\n\n"
+                f"✅ Your order has been cancelled successfully.\n"
                 f"🔄 <b>API Status:</b> {api_message}\n\n"
                 f"💡 You can place a new order anytime or use 'Order Again' for the same service!",
                 parse_mode='HTML',
@@ -6192,19 +7160,19 @@ async def process_order_cancellation(user_id: int, order_id: str, order: Dict, q
             )
 
             logger.info(
-                "✅ Order %s cancelled successfully for user %s with refund", order_id, user_id)
+                "✅ Order %s cancelled successfully for user %s - no charge occurred", order_id, user_id)
         else:
             await query.edit_message_text(
-                f"⚠️ <b>Order Cancelled (Refund Issue)</b>\n\n"
+                f"⚠️ <b>Order Cancelled (Wallet Issue)</b>\n\n"
                 f"🆔 <b>Order ID:</b> #{order_id}\n"
-                f"🔄 Your order has been cancelled but there was an issue processing the refund.\n"
-                f"💰 Please contact support for refund assistance.\n\n"
+                f"🔄 Your order has been cancelled but there was an issue with the wallet system.\n"
+                f"💰 Please contact support if you were charged.\n\n"
                 f"🔄 <b>API Status:</b> {api_message}",
                 parse_mode='HTML'
             )
 
             logger.error(
-                "❌ Order %s cancelled but refund failed for user %s", order_id, user_id)
+                "❌ Order %s cancelled but wallet operation failed for user %s", order_id, user_id)
 
     except Exception as e:
         logger.error("❌ Error processing order cancellation: %s", str(e))
@@ -6280,7 +7248,7 @@ async def handle_cancel_order(update: Update, _context: ContextTypes.DEFAULT_TYP
             f"📱 <b>Number:</b> <code>{number}</code>\n"
             f"💰 <b>Amount:</b> ${cost}\n\n"
             f"⚡ <b>Processing automatic cancellation...</b>\n"
-            f"💰 Full refund will be processed automatically\n"
+            f"💰 Good news: No charge will be made to your wallet!\n"
             f"🔄 OTP monitoring will stop",
             parse_mode='HTML'
         )
@@ -6322,6 +7290,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             await handle_quick_refund(update, context)
         elif data == "show_help":
             await handle_show_help(update, context)
+        elif data == "contact_us":
+            await handle_contact_us(update, context)
         elif data == "admin_panel":
             await handle_admin_panel(update, context)
         elif data == "service_status":
@@ -6334,10 +7304,20 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         # Wallet-related callbacks
         elif data == "deposit_funds":
             await handle_deposit_funds(update, context)
+        elif data == "deposit_method_wallet":
+            await handle_deposit_method_wallet(update, context)
+        elif data == "deposit_method_binance":
+            await handle_deposit_method_binance(update, context)
+        elif data.startswith("deposit_wallet_"):
+            await handle_deposit_wallet_amount(update, context)
+        elif data.startswith("deposit_binance_"):
+            await handle_deposit_binance_amount(update, context)
         elif data.startswith("deposit_amount_"):
             await handle_deposit_amount(update, context)
         elif data.startswith("deposit_sent_"):
             await handle_deposit_sent(update, context)
+        elif data.startswith("binance_sent_"):
+            await handle_binance_deposit_sent(update, context)
         elif data == "cancel_deposit":
             await handle_cancel_deposit(update, context)
         elif data == "show_balance":
@@ -6418,6 +7398,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         elif data == "deposit_custom":
             # Handle custom deposit amount
             await handle_deposit_custom(update, context)
+        elif data == "deposit_wallet_custom":
+            # Handle custom wallet deposit
+            await handle_deposit_wallet_custom(update, context)
+        elif data == "deposit_binance_custom":
+            # Handle custom Binance deposit
+            await handle_deposit_binance_custom(update, context)
 
         # Unknown callback
         else:
@@ -6546,7 +7532,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             # Validate amount
             min_amount = wallet_system.MIN_DEPOSIT_USD if wallet_system else 5.00
-            max_amount = wallet_system.MAX_DEPOSIT_USD if wallet_system else 500.00
+            max_amount = wallet_system.MAX_DEPOSIT_USD if wallet_system else 1000.00
 
             if amount < min_amount:
                 await message.reply_text(
@@ -6566,37 +7552,91 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 return
 
+            # Get deposit method from user context
+            deposit_method = context.user_data.get('deposit_method', 'wallet')
+
             # Clear the state
             context.user_data['awaiting_deposit_amount'] = False
+            context.user_data.pop('deposit_method', None)
 
-            # Create deposit request
+            # Create deposit request based on method
             if wallet_system:
-                deposit_request = wallet_system.create_deposit_request(
-                    user_id=user.id,
-                    amount=amount,
-                    binance_wallet=BINANCE_WALLET
-                )
+                if deposit_method == 'binance':
+                    # Create Binance deposit request
+                    if not BINANCE_ID:
+                        await message.reply_text(
+                            "❌ <b>Binance ID Not Configured</b>\n\n"
+                            "Please contact administrator to set up Binance transfers.",
+                            parse_mode='HTML'
+                        )
+                        return
 
-                # Format deposit instructions
-                instructions_text = "💰 <b>Wallet Deposit Request</b>\n\n"
-                instructions_text += "\n".join(deposit_request['instructions'])
+                    deposit_request = wallet_system.create_binance_deposit_request(
+                        user_id=user.id,
+                        amount=amount,
+                        binance_id=BINANCE_ID
+                    )
 
-                keyboard = [[
-                    InlineKeyboardButton(
-                        "✅ Payment Sent", callback_data=f"deposit_sent_{deposit_request['deposit_id']}"),
-                    InlineKeyboardButton(
-                        "❌ Cancel", callback_data="cancel_deposit")
-                ]]
+                    # Format Binance deposit instructions
+                    instructions_text = (
+                        f"🟡 <b>Binance Transfer Instructions</b>\n\n"
+                        f"💰 <b>Amount:</b> ${amount:.2f} USDT\n\n"
+                        f"Please make the payment via Binance (Binance to Binance transfer) to minimize transaction fees.\n\n"
+                        f"🆔 <b>My Binance ID:</b> <code>{BINANCE_ID}</code>\n\n"
+                        f"📋 <b>Instructions:</b>\n"
+                        f"1. Open Binance app/website\n"
+                        f"2. Go to Pay → Transfer\n"
+                        f"3. Enter Binance ID: <code>{BINANCE_ID}</code>\n"
+                        f"4. Send exactly <b>${amount:.2f} USDT</b>\n"
+                        f"5. Copy the Transaction ID (TXID)\n"
+                        f"6. Click 'Payment Sent' below\n\n"
+                        f"⚠️ <b>Important:</b>\n"
+                        f"• Send exactly the specified amount\n"
+                        f"• Use USDT (Tether USD)\n"
+                        f"• Save your transaction receipt\n\n"
+                        f"After payment, please enter your Transaction ID (TXID) or upload a screenshot.\n"
+                        f"Once admin verifies, your balance will be credited.\n\n"
+                        f"🆔 <b>Deposit ID:</b> <code>{deposit_request['deposit_id']}</code>"
+                    )
+
+                    keyboard = [[
+                        InlineKeyboardButton(
+                            "✅ Payment Sent", callback_data=f"binance_sent_{deposit_request['deposit_id']}"),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="cancel_deposit")
+                    ]]
+
+                else:
+                    # Create wallet deposit request (default)
+                    deposit_request = wallet_system.create_deposit_request(
+                        user_id=user.id,
+                        amount=amount,
+                        binance_wallet=BINANCE_WALLET
+                    )
+
+                    # Format wallet deposit instructions
+                    instructions_text = "� <b>Wallet Deposit Request</b>\n\n"
+                    instructions_text += "\n".join(
+                        deposit_request['instructions'])
+
+                    keyboard = [[
+                        InlineKeyboardButton(
+                            "✅ Payment Sent", callback_data=f"deposit_sent_{deposit_request['deposit_id']}"),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="cancel_deposit")
+                    ]]
+
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await message.reply_text(
                     instructions_text,
-                    parse_mode='Markdown',
+                    parse_mode='HTML' if deposit_method == 'binance' else 'Markdown',
                     reply_markup=reply_markup
                 )
 
                 logger.info(
-                    "💰 Custom deposit request created for user %s: $%.2f", user.id, amount)
+                    "💰 Custom %s deposit request created for user %s: $%.2f",
+                    deposit_method, user.id, amount)
             else:
                 await message.reply_text("❌ Wallet system not available.")
 
@@ -6607,12 +7647,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "No symbols like $ or USD needed.",
                 parse_mode='HTML'
             )
-        except RuntimeError as e:
+        except Exception as e:
             logger.error("Error handling custom deposit amount: %s", e)
             await message.reply_text(
                 "❌ Error processing your deposit amount. Please try again."
             )
             context.user_data['awaiting_deposit_amount'] = False
+            context.user_data.pop('deposit_method', None)
 
 # =============================================================================
 # ERROR HANDLING
@@ -6821,11 +7862,33 @@ def main():
         application.add_handler(CommandHandler("balance", balance_command))
         application.add_handler(CommandHandler("orders", orders_command))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("contact", contact_command))
         application.add_handler(CommandHandler("refund", refund_command))
         application.add_handler(CommandHandler("admin", admin_command))
         application.add_handler(CommandHandler("status", status_command))
         application.add_handler(CommandHandler(
             "approve_refund", approve_refund_command))
+
+        # Add database admin commands
+        try:
+            from src.database_admin import DatabaseAdminCommands
+            db_admin = DatabaseAdminCommands(db)
+
+            application.add_handler(CommandHandler(
+                "db_status", db_admin.protection_status))
+            application.add_handler(CommandHandler(
+                "db_backups", db_admin.list_backups))
+            application.add_handler(CommandHandler(
+                "db_backup", db_admin.manual_backup))
+            application.add_handler(CommandHandler(
+                "db_validate", db_admin.validate_database))
+            application.add_handler(CommandHandler(
+                "db_emergency", db_admin.create_emergency_backup))
+
+            logger.info("✅ Database admin commands registered")
+
+        except ImportError as e:
+            logger.warning(f"⚠️ Database admin commands not available: {e}")
 
         # Add callback query handler
         application.add_handler(CallbackQueryHandler(callback_query_handler))

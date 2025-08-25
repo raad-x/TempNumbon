@@ -8,7 +8,7 @@ import sys
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 
 # Add src to path for imports
@@ -122,7 +122,7 @@ class ConfigurationTool:
         )
 
         config['SMSPOOL_API_KEY'] = self.get_input(
-            "SMSPool API Key (from smspool.net)",
+            "SMS Service API Key",
             required=True,
             validation=lambda x: len(x) > 10
         )
@@ -216,9 +216,10 @@ class ConfigurationTool:
         print("\n📱 SERVICES MANAGEMENT")
         print("=" * 50)
 
-        current_config = self.load_current_config()
-
         while True:
+            # Reload config each iteration to show current state
+            current_config = self.load_current_config()
+
             print("\nCurrently enabled services:")
             services = [
                 ('RING4', 'Ring4'),
@@ -232,7 +233,9 @@ class ConfigurationTool:
                     f'ENABLE_{service_key}', 'true') == 'true'
                 status = "✅ Enabled" if enabled else "❌ Disabled"
                 priority = current_config.get(f'{service_key}_PRIORITY', 'N/A')
-                print(f"  {service_name}: {status} (Priority: {priority})")
+                display_name = current_config.get(
+                    f'{service_key}_DISPLAY_NAME', service_name)
+                print(f"  {display_name}: {status} (Priority: {priority})")
 
             print("\nOptions:")
             print("1. Enable/Disable services")
@@ -261,9 +264,10 @@ class ConfigurationTool:
         print("\n💰 PRICING CONFIGURATION")
         print("=" * 50)
 
-        current_config = self.load_current_config()
-
         while True:
+            # Reload config each iteration to show current state
+            current_config = self.load_current_config()
+
             # Show current pricing
             use_fixed = current_config.get(
                 'USE_FIXED_PRICING', 'false') == 'true'
@@ -420,7 +424,7 @@ class ConfigurationTool:
 
             print("\n✅ Configuration validation completed")
 
-        except Exception as e:
+        except (ImportError, AttributeError) as e:
             print(f"❌ Configuration validation failed: {str(e)}")
 
     def backup_restore_menu(self):
@@ -520,7 +524,7 @@ class ConfigurationTool:
             print(
                 f"  Maintenance: {'ON' if config_manager.get('MAINTENANCE_MODE') else 'OFF'}")
 
-        except Exception as e:
+        except (ImportError, AttributeError, KeyError) as e:
             print(f"❌ Error reading configuration: {str(e)}")
 
     def export_config_summary(self):
@@ -566,12 +570,12 @@ class ConfigurationTool:
             }
 
             export_file = f"config_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(export_file, 'w') as f:
+            with open(export_file, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2)
 
             print(f"✅ Configuration summary exported to: {export_file}")
 
-        except Exception as e:
+        except (IOError, OSError) as e:
             print(f"❌ Export failed: {str(e)}")
 
     # Helper methods
@@ -592,7 +596,7 @@ class ConfigurationTool:
                     if not validation(value):
                         print("❌ Invalid value")
                         continue
-                except:
+                except (ValueError, TypeError):
                     print("❌ Invalid value format")
                     continue
 
@@ -639,7 +643,7 @@ class ConfigurationTool:
         """Load current configuration from file"""
         config = {}
         if self.config_file.exists():
-            with open(self.config_file, 'r') as f:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
@@ -652,28 +656,31 @@ class ConfigurationTool:
         # Read the template to preserve comments and structure
         template_lines = []
         if self.config_file.exists():
-            with open(self.config_file, 'r') as f:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
                 template_lines = f.readlines()
 
+        # Create a copy to avoid modifying the original
+        config_copy = config.copy()
+
         # Write updated config
-        with open(self.config_file, 'w') as f:
+        with open(self.config_file, 'w', encoding='utf-8') as f:
             if template_lines:
                 # Update existing file
                 for line in template_lines:
                     if '=' in line and not line.strip().startswith('#'):
                         key = line.split('=')[0].strip()
-                        if key in config:
-                            f.write(f"{key}={config[key]}\n")
-                            del config[key]
+                        if key in config_copy:
+                            f.write(f"{key}={config_copy[key]}\n")
+                            del config_copy[key]
                         else:
                             f.write(line)
                     else:
                         f.write(line)
 
                 # Add any new config values
-                if config:
+                if config_copy:
                     f.write("\n# Additional settings\n")
-                    for key, value in config.items():
+                    for key, value in config_copy.items():
                         f.write(f"{key}={value}\n")
             else:
                 # Create new file

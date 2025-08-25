@@ -1,6 +1,40 @@
-# File: .gitignore
+# Ring4 SMS Bot - Git Ignore Rules
+# Sensitive Configuration
 .env
+
+# Python Cache & Bytecode
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs & Runtime Files
 *.log
-logs/
+logs/*.log
+*.pid
+
+# Database Backups (keep structure, ignore content)
+data/backups/*.json
+data/ring4_database.json
+
+# Development & IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual Environment
 venv/
+env/
+.venv/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Temporary Files
+*.tmp
+*.temp
+:memory:
